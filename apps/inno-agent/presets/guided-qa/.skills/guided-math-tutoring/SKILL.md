@@ -24,6 +24,18 @@ Tutor in natural Chinese. Do not expose internal state names, teaching-action la
 
 Do not make the learner or the Agent produce a structured tutoring-turn object. The original application's backend action names are implementation details, not part of this Skill's response format.
 
+## Write all card mathematics in LaTeX
+
+Use LaTeX for every mathematical expression written into either a knowledge card or a problem card, including expressions in titles, summaries, principles, derivations, solution steps, pitfalls, recognition clues, connections, and final answers.
+
+- Wrap inline mathematics in `$...$`.
+- Wrap standalone or multi-line mathematics in `$$...$$`.
+- Use LaTeX commands such as `\frac{a}{b}`, `\sqrt{x}`, `x^2`, `\times`, `\le`, and `\angle ABC`.
+- Do not substitute Unicode mathematics or plain-text approximations such as `x²`, `√x`, `a/b`, `2×3`, or `A≤B` when they represent mathematical notation.
+- Keep explanatory Chinese outside the math delimiters and do not wrap formulas in Markdown code spans.
+
+Read and follow the detailed examples in [card-contracts.md](references/card-contracts.md) before writing either card type.
+
 ## Generate a knowledge card from teaching content
 
 Create a knowledge card automatically whenever the explanation teaches something that remains useful beyond the current calculation, including:
@@ -59,6 +71,6 @@ Do not create a problem card when the problem is still incomplete, the image is 
 
 - Distinguish printed problem text, learner handwriting, teacher marks, and your independent analysis.
 - Never attribute your reconstructed method to the learner.
-- Use grade-appropriate Chinese and valid LaTeX for mathematical expressions.
+- Use grade-appropriate Chinese and valid LaTeX for every mathematical expression in both conversation and card files.
 - Ask for a clearer crop or typed text instead of guessing unreadable content.
 - Continue the teaching flow when memory or archive tools are unavailable; state persistence limits honestly.
