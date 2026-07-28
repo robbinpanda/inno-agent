@@ -26,10 +26,7 @@ Run it:
 - before answering a request to view, select, print, or export cards;
 - after a learner manually edits or deletes a card and asks to refresh the export page.
 
-The command creates or refreshes:
-
-- `card-export/index.html`
-- `card-export/cards-data.js`
+The command creates or refreshes `card-export/index.html`. The generated page embeds the current card data directly so it works inside Inno Agent's HTML preview without loading a relative companion script.
 
 It never edits or deletes files under `learning-cards/`.
 
@@ -63,3 +60,5 @@ Use the supplied assets and script instead of rewriting the page for each conver
 ## Handle empty or invalid input
 
 Generate the page even when there are no cards so the learner sees a useful empty state. Skip unreadable files with a clear warning while continuing to export the remaining cards. If the script cannot run, state the limitation and point to the Markdown cards; do not pretend the page is current.
+
+After refreshing, confirm the command's reported card count is nonzero when source cards exist. If the page still shows zero, rerun the command and reopen `card-export/index.html`; do not create a separate hand-written data file.

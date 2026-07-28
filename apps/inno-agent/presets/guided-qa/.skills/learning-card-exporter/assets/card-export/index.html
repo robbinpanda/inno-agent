@@ -1158,7 +1158,16 @@
 
     <section id="print-root" class="print-root print-layout-double" aria-label="学习卡片 PDF 打印区"></section>
 
-    <script src="./cards-data.js"></script>
+    <!-- CARD_EXPORT_DATA_START -->
+    <script id="card-export-data">
+      window.CARD_EXPORT_DATA = {
+        schemaVersion: 1,
+        generatedAt: null,
+        cards: [],
+        warnings: [],
+      };
+    </script>
+    <!-- CARD_EXPORT_DATA_END -->
     <script>
       (() => {
         "use strict";

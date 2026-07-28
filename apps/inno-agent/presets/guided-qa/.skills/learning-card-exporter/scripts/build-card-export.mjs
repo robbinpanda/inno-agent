@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { copyFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,6 +10,8 @@ const templateDirectory = join(skillDirectory, "assets", "card-export");
 const workspaceRoot = resolve(process.argv[2] || process.cwd());
 const cardRoot = join(workspaceRoot, "learning-cards");
 const outputDirectory = join(workspaceRoot, "card-export");
+const DATA_START_MARKER = "<!-- CARD_EXPORT_DATA_START -->";
+const DATA_END_MARKER = "<!-- CARD_EXPORT_DATA_END -->";
 
 const CARD_SOURCES = [
   { directory: "knowledge", type: "knowledge_card" },
@@ -142,13 +144,27 @@ async function build() {
     warnings,
   };
 
+  const template = await readFile(join(templateDirectory, "index.html"), "utf8");
+  const dataStart = template.indexOf(DATA_START_MARKER);
+  const dataEnd = template.indexOf(DATA_END_MARKER);
+  if (dataStart < 0 || dataEnd <= dataStart) {
+    throw new Error("Card export template is missing its embedded-data markers");
+  }
+
+  const embeddedData = [
+    DATA_START_MARKER,
+    '<script id="card-export-data">',
+    `window.CARD_EXPORT_DATA = ${serializeForJavaScript(payload)};`,
+    "</script>",
+    DATA_END_MARKER,
+  ].join("\n");
+  const html = `${template.slice(0, dataStart)}${embeddedData}${template.slice(
+    dataEnd + DATA_END_MARKER.length,
+  )}`;
+
   await mkdir(outputDirectory, { recursive: true });
-  await copyFile(join(templateDirectory, "index.html"), join(outputDirectory, "index.html"));
-  await writeFile(
-    join(outputDirectory, "cards-data.js"),
-    `window.CARD_EXPORT_DATA = ${serializeForJavaScript(payload)};\n`,
-    "utf8",
-  );
+  await writeFile(join(outputDirectory, "index.html"), html, "utf8");
+  await rm(join(outputDirectory, "cards-data.js"), { force: true });
 
   const knowledgeCount = cards.filter((card) => card.type === "knowledge_card").length;
   const problemCount = cards.filter((card) => card.type === "problem_card").length;

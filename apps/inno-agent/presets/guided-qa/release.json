@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "presetId": "guided-qa",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "managedPaths": [
     "agent.md",
     ".skills/guided-math-tutoring",
