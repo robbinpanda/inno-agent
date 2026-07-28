@@ -157,6 +157,7 @@ $managedPaths = @($manifest.managedPaths)
 $expectedManagedPaths = @(
     "agent.md",
     ".skills/guided-math-tutoring",
+    ".skills/learning-card-exporter",
     "maintenance",
     "release.json"
 )
@@ -165,7 +166,7 @@ if ($managedPathDiff) {
     throw "release.json managedPaths differs from the allowed guided-qa set"
 }
 $preservedWorkspacePaths = @($manifest.preservedWorkspacePaths)
-$expectedPreservedWorkspacePaths = @(".chat-images", "learning-cards", "practice")
+$expectedPreservedWorkspacePaths = @(".chat-images", "card-export", "learning-cards", "practice")
 $preservedPathDiff = Compare-Object -ReferenceObject ($expectedPreservedWorkspacePaths | Sort-Object) -DifferenceObject ($preservedWorkspacePaths | Sort-Object)
 if ($preservedPathDiff) {
     throw "release.json preservedWorkspacePaths differs from the protected guided-qa set"

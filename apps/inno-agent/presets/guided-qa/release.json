@@ -1,15 +1,17 @@
 {
   "schemaVersion": 1,
   "presetId": "guided-qa",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "managedPaths": [
     "agent.md",
     ".skills/guided-math-tutoring",
+    ".skills/learning-card-exporter",
     "maintenance",
     "release.json"
   ],
   "preservedWorkspacePaths": [
     ".chat-images",
+    "card-export",
     "learning-cards",
     "practice"
   ]

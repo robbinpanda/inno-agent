@@ -35,6 +35,8 @@ Create a knowledge card automatically whenever the explanation teaches something
 
 Create the card during the same tutoring turn, after the explanation, by writing it to `learning-cards/knowledge/<slug>.md`. Do not merely say that a card could be created. Tell the learner the card was created and link or name the file.
 
+After writing or updating the card, use `$learning-card-exporter` to refresh `card-export/index.html`. This refresh is part of card creation and does not require a separate learner request.
+
 If workspace writing is unavailable, show the complete card inline using the same Markdown structure instead of silently skipping it.
 
 Do not create a knowledge card for one-off substitution, arithmetic, sign correction, mechanical rewriting, or a transition that only serves the current problem—unless the learner explicitly asks to save that point.
@@ -44,6 +46,8 @@ Card creation does not require the learner to ask for saving. Long-term L2 archi
 ## Generate a problem card at completion
 
 Create or update one problem card when a problem has been worked through to a stable conclusion, or when the learner asks for a summary. Write it to `learning-cards/problems/<slug>.md` and tell the learner where it is.
+
+After writing or updating the card, use `$learning-card-exporter` to refresh `card-export/index.html`. Tell the learner that the refreshed export page can be used to select cards and print them as PDF.
 
 If workspace writing is unavailable, show the complete problem card inline using the same Markdown structure.
 
