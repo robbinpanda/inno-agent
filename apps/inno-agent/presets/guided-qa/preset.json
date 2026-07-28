@@ -1,0 +1,8 @@
+{
+  "id": "guided-qa",
+  "version": "0.2.0",
+  "name": "引导式答疑",
+  "description": "面向中国初高中数学的诊断式答疑：先确认题目和学生思路，再定位卡点、分步讲解、检查理解，并沉淀知识卡片与题目卡片。",
+  "icon": "messages-circle",
+  "category": "教学"
+}
