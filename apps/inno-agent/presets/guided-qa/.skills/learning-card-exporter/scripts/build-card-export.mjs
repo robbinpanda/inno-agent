@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,8 +11,9 @@ const templateDirectory = join(skillDirectory, "assets", "card-export");
 const workspaceRoot = resolve(process.argv[2] || process.cwd());
 const cardRoot = join(workspaceRoot, "learning-cards");
 const outputDirectory = join(workspaceRoot, "card-export");
-const DATA_START_MARKER = "<!-- CARD_EXPORT_DATA_START -->";
-const DATA_END_MARKER = "<!-- CARD_EXPORT_DATA_END -->";
+const WORKSPACE_ID = "preset-guided-qa";
+const CONFIG_RESOURCE_ROOT = "card-export";
+const STATIC_ASSETS = ["index.html", "app.css", "app.js"];
 
 const CARD_SOURCES = [
   { directory: "knowledge", type: "knowledge_card" },
@@ -20,6 +22,16 @@ const CARD_SOURCES = [
 
 function normalizeText(value) {
   return String(value ?? "").replace(/\r\n/g, "\n").trim();
+}
+
+function previewText(sections) {
+  const source = sections.find((section) => section.markdown)?.markdown || "";
+  return source
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/[#*_`$>|[\]()-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 180);
 }
 
 function stripYamlValue(value) {
@@ -32,6 +44,17 @@ function stripYamlValue(value) {
     return trimmed.slice(1, -1);
   }
   return trimmed;
+}
+
+function serializeForJavaScript(value) {
+  return JSON.stringify(value, null, 2)
+    .replaceAll("<", "\\u003c")
+    .replaceAll("\u2028", "\\u2028")
+    .replaceAll("\u2029", "\\u2029");
+}
+
+function cardChunkName(sourcePath) {
+  return `${createHash("sha256").update(sourcePath).digest("hex").slice(0, 20)}.js`;
 }
 
 function parseCard(markdown, fallbackType, sourcePath, updatedAt) {
@@ -81,7 +104,8 @@ function parseCard(markdown, fallbackType, sourcePath, updatedAt) {
     title,
     updatedAt,
     sourcePath,
-    sections,
+    preview: previewText(sections),
+    markdown: normalized,
   };
 }
 
@@ -128,48 +152,64 @@ async function readCards() {
   return { cards, warnings };
 }
 
-function serializeForJavaScript(value) {
-  return JSON.stringify(value, null, 2)
-    .replaceAll("<", "\\u003c")
-    .replaceAll("\u2028", "\\u2028")
-    .replaceAll("\u2029", "\\u2029");
-}
-
 async function build() {
   const { cards, warnings } = await readCards();
-  const payload = {
-    schemaVersion: 1,
+  const manifestCards = cards.map(({ markdown, ...card }) => {
+    const chunkName = cardChunkName(card.sourcePath);
+    return {
+      ...card,
+      chunkPath: `${CONFIG_RESOURCE_ROOT}/cards/${chunkName}`,
+    };
+  });
+  const manifest = {
+    schemaVersion: 2,
+    workspaceId: WORKSPACE_ID,
     generatedAt: new Date().toISOString(),
-    cards,
+    cards: manifestCards,
     warnings,
   };
 
-  const template = await readFile(join(templateDirectory, "index.html"), "utf8");
-  const dataStart = template.indexOf(DATA_START_MARKER);
-  const dataEnd = template.indexOf(DATA_END_MARKER);
-  if (dataStart < 0 || dataEnd <= dataStart) {
-    throw new Error("Card export template is missing its embedded-data markers");
-  }
-
-  const embeddedData = [
-    DATA_START_MARKER,
-    '<script id="card-export-data">',
-    `window.CARD_EXPORT_DATA = ${serializeForJavaScript(payload)};`,
-    "</script>",
-    DATA_END_MARKER,
-  ].join("\n");
-  const html = `${template.slice(0, dataStart)}${embeddedData}${template.slice(
-    dataEnd + DATA_END_MARKER.length,
-  )}`;
-
   await mkdir(outputDirectory, { recursive: true });
-  await writeFile(join(outputDirectory, "index.html"), html, "utf8");
+  const cardChunkDirectory = join(outputDirectory, "cards");
+  await rm(cardChunkDirectory, { recursive: true, force: true });
+  await mkdir(cardChunkDirectory, { recursive: true });
+  await Promise.all(
+    STATIC_ASSETS.map((asset) =>
+      copyFile(join(templateDirectory, asset), join(outputDirectory, asset)),
+    ),
+  );
+  await Promise.all([
+    writeFile(
+      join(outputDirectory, "manifest.json"),
+      `${JSON.stringify(manifest, null, 2)}\n`,
+      "utf8",
+    ),
+    writeFile(
+      join(outputDirectory, "manifest.js"),
+      `window.CARD_EXPORT_MANIFEST = ${serializeForJavaScript(manifest)};\n`,
+      "utf8",
+    ),
+    ...cards.map((card) => {
+      const chunkPath = join(cardChunkDirectory, cardChunkName(card.sourcePath));
+      const chunk = [
+        "window.CARD_EXPORT_CARD_CHUNKS = window.CARD_EXPORT_CARD_CHUNKS || Object.create(null);",
+        `window.CARD_EXPORT_CARD_CHUNKS[${serializeForJavaScript(card.id)}] = ${serializeForJavaScript(card.markdown)};`,
+        "",
+      ].join("\n");
+      return writeFile(chunkPath, chunk, "utf8");
+    }),
+  ]);
   await rm(join(outputDirectory, "cards-data.js"), { force: true });
 
-  const knowledgeCount = cards.filter((card) => card.type === "knowledge_card").length;
-  const problemCount = cards.filter((card) => card.type === "problem_card").length;
-  console.log(`Learning-card export page refreshed: ${join(outputDirectory, "index.html")}`);
-  console.log(`Cards: ${cards.length} total, ${knowledgeCount} knowledge, ${problemCount} problem`);
+  const knowledgeCount = manifestCards.filter((card) => card.type === "knowledge_card").length;
+  const problemCount = manifestCards.filter((card) => card.type === "problem_card").length;
+  console.log(`Learning-card export workspace refreshed: ${outputDirectory}`);
+  console.log(
+    `Cards: ${manifestCards.length} total, ${knowledgeCount} knowledge, ${problemCount} problem`,
+  );
+  console.log(
+    "Card bodies remain in learning-cards/*.md; portable browser chunks are loaded only when exporting.",
+  );
   for (const warning of warnings) {
     console.warn(`Warning: ${warning}`);
   }
