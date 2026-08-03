@@ -67,6 +67,9 @@
 		"graph": {
 			"fit": "自适应",
 			"center": "居中",
+			"colorType": "页面类型",
+			"colorCommunity": "社区",
+			"communityStats": "{{count}} 个社区 · Q {{modularity}}",
 			"labels": "标签",
 			"size": "节点大小",
 			"refresh": "刷新图谱",
@@ -412,6 +415,13 @@
 			"saved": "已保存",
 			"clear": "清除"
 		},
+		"tavily": {
+			"title": "联网搜索 (Tavily)",
+			"desc": "为 agent 提供联网检索能力。需在 tavily.com 获取 API Key（形如 tvly-…）。未配置时 web_search 工具不可用。",
+			"placeholder": "tvly-…",
+			"saved": "已保存",
+			"clear": "清除"
+		},
 		"form": {
 			"providerId": "提供方 ID",
 			"baseUrl": "Base URL",
@@ -422,7 +432,8 @@
 			"contextWindow": "上下文窗口",
 			"maxTokens": "最大 Tokens",
 			"reasoning": "支持推理",
-			"supportsImages": "支持图片输入",
+			"supportsImages": "模型 API 原生支持图片",
+			"supportsImagesHint": "仅在确认 Provider 接受图片消息时开启。关闭后仍可上传图片，系统会保存图片并通过 OCR 处理。",
 			"authHeader": "使用 Bearer 鉴权",
 			"bypassProxy": "绕过系统代理",
 			"makeDefault": "设为默认",
@@ -518,7 +529,7 @@
 		"uploadFiles": "上传文件到工作区",
 		"uploadHint": "请先选择已有工作区或开始对话后再上传文件",
 		"attachImage": "添加图片",
-		"imageNotSupported": "当前模型不支持图片",
+		"attachImageViaOcr": "添加图片（当前模型将通过 OCR 处理）",
 		"stopGeneration": "停止生成",
 		"retryLast": "重试上一条消息",
 		"send": "发送",
@@ -645,6 +656,11 @@
 		"newFileHere": "在此新建文件",
 		"newFolderHere": "在此新建文件夹",
 		"confirmDelete": "确认删除？",
+		"multiSelect": "多选文件",
+		"exitMultiSelect": "退出多选",
+		"selectedCount": "已选择 {{count}} 个文件",
+		"fileSelectionOnly": "请选择文件（文件夹不可选）",
+		"deleteSelected": "删除已选文件",
 		"uploadSkill": "上传技能包 (.zip/.md) 到 .skills",
 		"dropToUpload": "拖放文件以上传"
 	},

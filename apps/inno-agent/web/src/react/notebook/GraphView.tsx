@@ -1,22 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Scan, Shuffle, RefreshCw } from "lucide-react";
+import { Scan, Shuffle, RefreshCw, Network, Tag } from "lucide-react";
 import { Spinner } from "../ui/Spinner.js";
 import cytoscape, { type Core, type ElementDefinition } from "cytoscape";
-// @ts-expect-error - cytoscape-cola has no public types
-import cola from "cytoscape-cola";
+import { ForceSimulation, type SimLink, type SimNode } from "./force-simulation.js";
 import type { WikiGraphEdge, WikiGraphNode } from "../../types/wiki.js";
 import { notebookStore } from "../../stores/notebook-store.js";
 import { useStoreSnapshot } from "../hooks.js";
 
-let registered = false;
-function ensureRegistered() {
-	if (registered) return;
-	cytoscape.use(cola);
-	registered = true;
-}
-
 type NodeCategory = "source-summary" | "entity" | "concept" | "analysis" | "tag";
+type GraphColorMode = "type" | "community";
 const ALL_CATEGORIES: NodeCategory[] = ["source-summary", "entity", "concept", "analysis", "tag"];
 const DEFAULT_VISIBLE: NodeCategory[] = ["source-summary", "entity", "concept", "analysis"];
 
@@ -28,56 +21,211 @@ const TYPE_COLORS: Record<string, string> = {
 	tag: "#8b949e",
 };
 
+const COMMUNITY_COLORS = [
+	"#4b8ef0",
+	"#3dba6f",
+	"#e8993a",
+	"#9b5de5",
+	"#ef6b73",
+	"#2aa9a1",
+	"#d6a328",
+	"#db6fa8",
+];
+
+function communityColor(node: WikiGraphNode): string {
+	if (node.type === "tag") return TYPE_COLORS.tag;
+	return COMMUNITY_COLORS[(node.community ?? 0) % COMMUNITY_COLORS.length] ?? TYPE_COLORS.tag;
+}
+
+function deduplicateEdges(edges: WikiGraphEdge[]): WikiGraphEdge[] {
+	const byPair = new Map<string, WikiGraphEdge>();
+	for (const edge of edges) {
+		const endpoints = edge.type === "link"
+			? [edge.source, edge.target].sort()
+			: [edge.source, edge.target];
+		const key = `${edge.type}\u0000${endpoints[0]}\u0000${endpoints[1]}`;
+		const existing = byPair.get(key);
+		if (!existing || (edge.weight ?? 1) > (existing.weight ?? 1)) byPair.set(key, edge);
+	}
+	return [...byPair.values()];
+}
+
+function truncateLabel(label: string, maxLength = 20): string {
+	return label.length <= maxLength ? label : `${label.slice(0, maxLength - 3)}...`;
+}
+
+function buildCommunitySeedPositions(nodes: WikiGraphNode[]): Map<string, { x: number; y: number }> {
+	const groups = new Map<number, WikiGraphNode[]>();
+	for (const node of nodes) {
+		const community = node.type === "tag" ? -1 : (node.community ?? 0);
+		const group = groups.get(community) ?? [];
+		group.push(node);
+		groups.set(community, group);
+	}
+
+	const orderedGroups = [...groups.entries()].sort(([a], [b]) => a - b);
+	const columns = Math.max(1, Math.ceil(Math.sqrt(orderedGroups.length)));
+	const positions = new Map<string, { x: number; y: number }>();
+	const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+
+	orderedGroups.forEach(([, group], groupIndex) => {
+		const centerX = (groupIndex % columns) * 540;
+		const centerY = Math.floor(groupIndex / columns) * 440;
+		group.sort((a, b) => a.id.localeCompare(b.id)).forEach((node, nodeIndex) => {
+			const radius = nodeIndex === 0 ? 0 : 44 + Math.sqrt(nodeIndex) * 25;
+			const angle = nodeIndex * goldenAngle;
+			positions.set(node.id, {
+				x: centerX + Math.cos(angle) * radius,
+				y: centerY + Math.sin(angle) * radius,
+			});
+		});
+	});
+
+	return positions;
+}
+
 function buildElements(nodes: WikiGraphNode[], edges: WikiGraphEdge[]): ElementDefinition[] {
+	const uniqueEdges = deduplicateEdges(edges);
 	const degree = new Map<string, number>();
-	for (const e of edges) {
+	for (const e of uniqueEdges) {
 		degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
 		degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
 	}
+	const pageDegrees = nodes
+		.filter((node) => node.type !== "tag")
+		.map((node) => degree.get(node.id) ?? node.degree ?? 0)
+		.sort((a, b) => a - b);
+	const labelThreshold = Math.max(3, pageDegrees[Math.floor(pageDegrees.length * 0.6)] ?? 3);
+	const maxWeight = Math.max(...uniqueEdges.filter((edge) => edge.type === "link").map((edge) => edge.weight ?? 1), 1);
 	const nodeIds = new Set(nodes.map((n) => n.id));
-	const els: ElementDefinition[] = nodes.map((n) => ({
-		data: {
-			id: n.id,
-			label: n.title || n.id,
-			type: n.type,
-			color: TYPE_COLORS[n.type] ?? "#8b949e",
-			degree: degree.get(n.id) ?? 0,
-			size: 18 + Math.min(28, (degree.get(n.id) ?? 0) * 3),
-		},
-	}));
-	for (const e of edges) {
+	const nodeCommunities = new Map(nodes.map((node) => [node.id, node.community ?? 0]));
+	const seedPositions = buildCommunitySeedPositions(nodes);
+	const els: ElementDefinition[] = nodes.map((n) => {
+		const nodeDegree = degree.get(n.id) ?? n.degree ?? 0;
+		const fullLabel = n.title || n.id;
+		const showLabel = n.type === "source-summary" || n.type === "analysis" || nodeDegree >= labelThreshold;
+		const seed = seedPositions.get(n.id) ?? { x: 0, y: 0 };
+		return {
+			data: {
+				id: n.id,
+				label: showLabel ? truncateLabel(fullLabel) : "",
+				fullLabel,
+				type: n.type,
+				typeColor: TYPE_COLORS[n.type] ?? TYPE_COLORS.tag,
+				communityColor: communityColor(n),
+				color: TYPE_COLORS[n.type] ?? TYPE_COLORS.tag,
+				community: n.community ?? 0,
+				degree: nodeDegree,
+				size: 9 + Math.min(20, Math.sqrt(nodeDegree) * 3.5),
+				seedX: seed.x,
+				seedY: seed.y,
+			},
+			position: seed,
+		};
+	});
+	for (const e of uniqueEdges) {
 		if (!nodeIds.has(e.source) || !nodeIds.has(e.target)) continue;
+		const normalizedWeight = e.type === "tag" ? 0 : Math.min(1, (e.weight ?? 1) / maxWeight);
+		const sameCommunity = e.type === "link"
+			&& nodeCommunities.get(e.source) === nodeCommunities.get(e.target);
+		const baseOpacity = e.type === "tag" ? 0.1 : 0.04 + Math.pow(normalizedWeight, 1.4) * 0.56;
+		const communityEdgeOpacity = sameCommunity ? baseOpacity : Math.max(0.035, baseOpacity * 0.6);
+		const endpoints = e.type === "link" ? [e.source, e.target].sort() : [e.source, e.target];
 		els.push({
 			data: {
-				id: `${e.source}__${e.target}__${e.type}`,
+				id: `${endpoints[0]}__${endpoints[1]}__${e.type}`,
 				source: e.source,
 				target: e.target,
 				edgeType: e.type,
+				weight: e.weight ?? 1,
+				normalizedWeight,
+				sameCommunity,
+				edgeWidth: e.type === "tag" ? 0.25 : 0.15 + Math.pow(normalizedWeight, 1.3) * 0.95,
+				edgeOpacity: communityEdgeOpacity,
+				communityEdgeOpacity,
+				typeEdgeOpacity: baseOpacity,
 			},
 		});
 	}
 	return els;
 }
 
-function makeColaLayoutOptions(): cytoscape.LayoutOptions {
-	return {
-		name: "cola",
-		// Keep the simulation running so nodes continuously repel and dragging
-		// naturally nudges connected/nearby nodes out of the way.
-		infinite: true,
-		fit: false,
-		animate: true,
-		refresh: 1,
-		maxSimulationTime: 0,
-		ungrabifyWhileSimulating: false,
-		nodeSpacing: () => 18,
-		avoidOverlap: true,
-		handleDisconnected: true,
-		edgeLength: (edge: cytoscape.EdgeSingular) =>
-			edge.data("edgeType") === "tag" ? 90 : 130,
-		randomize: false,
-		padding: 24,
-	} as unknown as cytoscape.LayoutOptions;
+/**
+ * Rebuild the live simulation from the currently visible elements, keeping
+ * each node's on-screen position. Returns cytoscape nodes aligned index-for-
+ * index with the simulation's nodes so ticks can write positions back cheaply.
+ */
+function syncSimulation(cy: Core, sim: ForceSimulation, mode: GraphColorMode): cytoscape.NodeSingular[] {
+	const cyNodes: cytoscape.NodeSingular[] = [];
+	const simNodes: SimNode[] = [];
+	const indexById = new Map<string, number>();
+	cy.nodes(":visible").forEach((node) => {
+		const pos = node.position();
+		indexById.set(node.id(), simNodes.length);
+		cyNodes.push(node);
+		simNodes.push({
+			id: node.id(),
+			x: pos.x,
+			y: pos.y,
+			vx: 0,
+			vy: 0,
+			radius: (Number(node.data("size")) || 14) / 2,
+			fixed: node.grabbed(),
+			group: Number(node.data("community")) || 0,
+		});
+	});
+
+	const degree = new Map<number, number>();
+	const rawLinks: { source: number; target: number; tag: boolean; weight: number }[] = [];
+	cy.edges(":visible").forEach((edge) => {
+		const source = indexById.get(edge.source().id());
+		const target = indexById.get(edge.target().id());
+		if (source === undefined || target === undefined || source === target) return;
+		degree.set(source, (degree.get(source) ?? 0) + 1);
+		degree.set(target, (degree.get(target) ?? 0) + 1);
+		rawLinks.push({
+			source,
+			target,
+			tag: edge.data("edgeType") === "tag",
+			weight: Number(edge.data("normalizedWeight")) || 0,
+		});
+	});
+	const links: SimLink[] = rawLinks.map((link) => {
+		// d3-force-style: hubs get weaker per-link springs so they stay put
+		// while leaves swing around them.
+		const minDegree = Math.max(1, Math.min(degree.get(link.source) ?? 1, degree.get(link.target) ?? 1));
+		const strength = Math.min(0.42, (link.tag ? 0.18 : 0.62) / minDegree + 0.035);
+		return {
+			source: link.source,
+			target: link.target,
+			length: link.tag ? 280 : 150 + (1 - link.weight) * 105,
+			strength,
+		};
+	});
+
+	sim.setGraph(simNodes, links);
+	sim.options.groupStrength = mode === "community" ? 0.025 : 0;
+	if (simNodes.length > 0) {
+		let cx = 0;
+		let cyy = 0;
+		for (const node of simNodes) {
+			cx += node.x;
+			cyy += node.y;
+		}
+		sim.setCenter(cx / simNodes.length, cyy / simNodes.length);
+	}
+	return cyNodes;
+}
+
+function applySimPositions(cy: Core, sim: ForceSimulation, cyNodes: cytoscape.NodeSingular[]): void {
+	cy.batch(() => {
+		for (let i = 0; i < cyNodes.length; i++) {
+			const simNode = sim.getNode(cyNodes[i].id());
+			// Grabbed/fixed nodes are positioned by cytoscape's own drag handling.
+			if (!simNode || simNode.fixed) continue;
+			cyNodes[i].position({ x: simNode.x, y: simNode.y });
+		}
+	});
 }
 
 export function GraphView() {
@@ -89,15 +237,20 @@ export function GraphView() {
 		selectedNodeId: notebookStore.selectedNodeId,
 		searchQuery: notebookStore.searchQuery,
 		highlight: notebookStore.highlightSet,
+		communities: notebookStore.communities,
 	}));
 
 	const containerRef = useRef<HTMLDivElement | null>(null);
 	const cyRef = useRef<Core | null>(null);
-	const layoutRef = useRef<cytoscape.Layouts | null>(null);
+	const simRef = useRef<ForceSimulation | null>(null);
+	if (!simRef.current) simRef.current = new ForceSimulation();
+	const simNodesRef = useRef<cytoscape.NodeSingular[]>([]);
+	const rafRef = useRef<number | null>(null);
 
 	const [visibleCategories, setVisibleCategories] = useState<Set<NodeCategory>>(
 		() => new Set(DEFAULT_VISIBLE),
 	);
+	const [colorMode, setColorMode] = useState<GraphColorMode>("community");
 	const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
 
 	const toggleCategory = useCallback((category: NodeCategory) => {
@@ -112,12 +265,10 @@ export function GraphView() {
 	const elements = useMemo(() => buildElements(state.nodes, state.edges), [state.nodes, state.edges]);
 
 	useEffect(() => {
-		ensureRegistered();
 		if (!containerRef.current) return;
 		const cy = cytoscape({
 			container: containerRef.current,
 			elements,
-			wheelSensitivity: 0.2,
 			minZoom: 0.2,
 			maxZoom: 2.5,
 			style: [
@@ -126,9 +277,9 @@ export function GraphView() {
 					style: {
 						"background-color": "data(color)",
 						label: "data(label)",
-						color: "#0f172a",
-						"font-size": 11,
-						"text-margin-y": 6,
+						color: "#334155",
+						"font-size": 10,
+						"text-margin-y": 5,
 						"text-valign": "bottom",
 						"text-halign": "center",
 						"text-outline-width": 2,
@@ -137,7 +288,7 @@ export function GraphView() {
 						width: "data(size)" as unknown as number,
 						height: "data(size)" as unknown as number,
 						"border-color": "#ffffff",
-						"border-width": 1.5,
+						"border-width": 1,
 						"overlay-opacity": 0,
 						"transition-property": "opacity, border-color, border-width",
 						"transition-duration": 150,
@@ -148,6 +299,7 @@ export function GraphView() {
 					style: {
 						"border-color": "#2563eb",
 						"border-width": 3,
+						label: "data(fullLabel)",
 					},
 				},
 				{
@@ -159,6 +311,7 @@ export function GraphView() {
 					style: {
 						"border-color": "#f59e0b",
 						"border-width": 3,
+						label: "data(fullLabel)",
 					},
 				},
 				{
@@ -168,17 +321,17 @@ export function GraphView() {
 				{
 					selector: "edge",
 					style: {
-						width: 1.4,
+						width: "data(edgeWidth)" as unknown as number,
 						"line-color": "#cbd5e1",
-						"curve-style": "bezier",
-						opacity: 0.7,
+						"curve-style": "straight",
+						opacity: "data(edgeOpacity)" as unknown as number,
 						"transition-property": "opacity, line-color, width",
 						"transition-duration": 150,
 					},
 				},
 				{
 					selector: "edge[edgeType = 'tag']",
-					style: { "line-color": "#e2e8f0", "line-style": "dashed" },
+					style: { "line-color": "#e2e8f0", "line-style": "dashed", opacity: 0.16 },
 				},
 				{
 					selector: "edge.dim",
@@ -190,13 +343,6 @@ export function GraphView() {
 				},
 			],
 		});
-
-		// Start continuous cola simulation. We keep a reference so we can stop/restart.
-		const layout = cy.layout(makeColaLayoutOptions());
-		layoutRef.current = layout;
-		layout.run();
-		// One-time fit after the first stabilisation pass.
-		setTimeout(() => cy.fit(undefined, 32), 600);
 
 		cy.on("tap", "node", (evt) => {
 			const id = evt.target.id() as string;
@@ -226,14 +372,107 @@ export function GraphView() {
 			cy.elements().removeClass("dim").removeClass("hl");
 		});
 
+		const sim = simRef.current!;
+		const startTicking = () => {
+			if (rafRef.current !== null) return;
+			const frame = () => {
+				if (!cyRef.current || !sim.running) {
+					rafRef.current = null;
+					return;
+				}
+				sim.tick();
+				applySimPositions(cy, sim, simNodesRef.current);
+				rafRef.current = requestAnimationFrame(frame);
+			};
+			rafRef.current = requestAnimationFrame(frame);
+		};
+		cy.scratch("innoStartTicking", startTicking);
+
+		// Obsidian-style drag: the grabbed node is pinned to the pointer while
+		// the simulation keeps running, so springs pull neighbours along and
+		// repulsion shoulders bystanders out of the way. Reheat only once the
+		// pointer actually moves — a plain click should not shake the graph.
+		let dragging = false;
+		cy.on("grab", "node", (evt) => {
+			const simNode = sim.getNode((evt.target as cytoscape.NodeSingular).id());
+			if (simNode) simNode.fixed = true;
+		});
+		cy.on("drag", "node", (evt) => {
+			const node = evt.target as cytoscape.NodeSingular;
+			const simNode = sim.getNode(node.id());
+			if (!simNode) return;
+			const pos = node.position();
+			simNode.x = pos.x;
+			simNode.y = pos.y;
+			if (!dragging) {
+				dragging = true;
+				sim.reheat(0.45, 0.28);
+				startTicking();
+			}
+		});
+		cy.on("free", "node", (evt) => {
+			const node = evt.target as cytoscape.NodeSingular;
+			const simNode = sim.getNode(node.id());
+			if (simNode) {
+				const pos = node.position();
+				simNode.x = pos.x;
+				simNode.y = pos.y;
+				simNode.fixed = false;
+			}
+			if (dragging) {
+				dragging = false;
+				sim.alphaTarget = 0;
+				sim.reheat(0.25);
+				startTicking();
+			}
+		});
+
 		cyRef.current = cy;
 		return () => {
-			layoutRef.current?.stop();
-			layoutRef.current = null;
+			if (rafRef.current !== null) {
+				cancelAnimationFrame(rafRef.current);
+				rafRef.current = null;
+			}
+			sim.stop();
+			simNodesRef.current = [];
 			cy.destroy();
 			cyRef.current = null;
 		};
 	}, [elements]); // eslint-disable-line react-hooks/exhaustive-deps
+
+	// Keep presentation and layout changes in one effect. Separate mode and
+	// visibility effects would each rebuild the simulation when the graph mounts.
+	useEffect(() => {
+		const cy = cyRef.current;
+		const sim = simRef.current;
+		if (!cy || !sim) return;
+		cy.batch(() => {
+			cy.nodes().forEach((node) => {
+				node.data("color", node.data(colorMode === "community" ? "communityColor" : "typeColor"));
+			});
+			cy.edges().forEach((edge) => {
+				edge.data("edgeOpacity", edge.data(colorMode === "community" ? "communityEdgeOpacity" : "typeEdgeOpacity"));
+			});
+			cy.nodes().forEach((node) => {
+				const type = (node.data("type") as NodeCategory) ?? "entity";
+				node.toggleClass("hidden", !visibleCategories.has(type));
+			});
+			cy.edges().forEach((edge) => {
+				const sourceHidden = edge.source().hasClass("hidden");
+				const targetHidden = edge.target().hasClass("hidden");
+				edge.toggleClass("hidden", sourceHidden || targetHidden);
+			});
+			if (colorMode === "community") {
+				cy.nodes(":visible").forEach((node) => {
+					node.position({ x: Number(node.data("seedX")), y: Number(node.data("seedY")) });
+				});
+			}
+		});
+		simNodesRef.current = syncSimulation(cy, sim, colorMode);
+		cy.fit(cy.elements(":visible"), 32);
+		sim.reheat(colorMode === "community" ? 0.35 : 0.6);
+		(cy.scratch("innoStartTicking") as (() => void) | undefined)?.();
+	}, [colorMode, elements, visibleCategories]);
 
 	// React to selection from outside (e.g. clicking the list)
 	useEffect(() => {
@@ -265,45 +504,25 @@ export function GraphView() {
 		cy.edges(":visible").addClass("dim");
 	}, [state.searchQuery, state.highlight]);
 
-	// Apply category visibility, then restart layout so it recomputes against the
-	// new node set (otherwise hidden nodes still contribute to forces visually).
-	useEffect(() => {
-		const cy = cyRef.current;
-		if (!cy) return;
-		const visible = visibleCategories;
-		cy.batch(() => {
-			cy.nodes().forEach((n) => {
-				const type = (n.data("type") as NodeCategory) ?? "entity";
-				if (visible.has(type)) n.removeClass("hidden");
-				else n.addClass("hidden");
-			});
-			cy.edges().forEach((e) => {
-				const src = e.source();
-				const tgt = e.target();
-				if (src.hasClass("hidden") || tgt.hasClass("hidden")) e.addClass("hidden");
-				else e.removeClass("hidden");
-			});
-		});
-		layoutRef.current?.stop();
-		const layout = cy.elements(":visible").layout(makeColaLayoutOptions());
-		layoutRef.current = layout;
-		layout.run();
-	}, [visibleCategories, elements]);
-
 	function fit() {
 		cyRef.current?.fit(undefined, 32);
 	}
 
 	function reLayout() {
 		const cy = cyRef.current;
-		if (!cy) return;
-		layoutRef.current?.stop();
-		const layout = cy.elements(":visible").layout({
-			...makeColaLayoutOptions(),
-			randomize: true,
-		} as unknown as cytoscape.LayoutOptions);
-		layoutRef.current = layout;
-		layout.run();
+		const sim = simRef.current;
+		if (!cy || !sim) return;
+		if (colorMode === "community") {
+			cy.batch(() => {
+				cy.nodes(":visible").forEach((node) => {
+					node.position({ x: Number(node.data("seedX")), y: Number(node.data("seedY")) });
+				});
+			});
+		}
+		simNodesRef.current = syncSimulation(cy, sim, colorMode);
+		cy.fit(cy.elements(":visible"), 32);
+		sim.reheat(0.8);
+		(cy.scratch("innoStartTicking") as (() => void) | undefined)?.();
 	}
 
 	const visibleNodeCount = useMemo(
@@ -330,20 +549,43 @@ export function GraphView() {
 	const displayNode = hoveredNode ?? selectedNode;
 
 	return (
-		<div className="relative flex h-full min-h-0 flex-col">
-			<div className="@container flex items-center gap-2 border-b border-[var(--inno-border)] bg-[var(--inno-surface)] px-3 py-2 text-xs text-[var(--inno-text-muted)]">
+		<div className="relative flex h-full min-h-0 flex-col overflow-hidden">
+			<div className="@container flex w-full min-w-0 items-center gap-2 overflow-x-auto whitespace-nowrap border-b border-[var(--inno-border)] bg-[var(--inno-surface)] px-3 py-2 text-xs text-[var(--inno-text-muted)]">
 				<button className="inline-flex items-center gap-1 rounded-md border border-[var(--inno-border)] bg-[var(--inno-surface)] px-2 py-1 hover:bg-[var(--inno-surface-muted)] hover:text-[var(--inno-text)]" onClick={fit} title={t("notebook.graph.fit")}>
 					<Scan size={14} />
-					<span className="hidden @[680px]:inline">{t("notebook.graph.fit")}</span>
+					<span className="hidden @[1050px]:inline">{t("notebook.graph.fit")}</span>
 				</button>
 				<button className="inline-flex items-center gap-1 rounded-md border border-[var(--inno-border)] bg-[var(--inno-surface)] px-2 py-1 hover:bg-[var(--inno-surface-muted)] hover:text-[var(--inno-text)]" onClick={reLayout} title={t("notebook.graph.relayout")}>
 					<Shuffle size={14} />
-					<span className="hidden @[680px]:inline">{t("notebook.graph.relayout")}</span>
+					<span className="hidden @[1050px]:inline">{t("notebook.graph.relayout")}</span>
 				</button>
 				<button className="inline-flex items-center gap-1 rounded-md border border-[var(--inno-border)] bg-[var(--inno-surface)] px-2 py-1 hover:bg-[var(--inno-surface-muted)] hover:text-[var(--inno-text)]" onClick={() => void notebookStore.loadGraph()} title={t("notebook.graph.refresh")}>
 					<RefreshCw size={14} />
-					<span className="hidden @[680px]:inline">{t("notebook.graph.refresh")}</span>
+					<span className="hidden @[1050px]:inline">{t("notebook.graph.refresh")}</span>
 				</button>
+				<div className="mx-1 h-4 w-px bg-[var(--inno-surface-muted)]" />
+				<div className="inline-flex rounded-md border border-[var(--inno-border)] bg-[var(--inno-surface-muted)] p-0.5">
+					<button
+						type="button"
+						onClick={() => setColorMode("type")}
+						className={`inline-flex items-center gap-1 rounded px-2 py-0.5 ${colorMode === "type" ? "bg-[var(--inno-surface)] text-[var(--inno-text)] shadow-sm" : "text-[var(--inno-text-subtle)]"}`}
+						title={t("notebook.graph.colorType")}
+						aria-pressed={colorMode === "type"}
+					>
+						<Tag size={13} />
+						<span className="hidden @[900px]:inline">{t("notebook.graph.colorType")}</span>
+					</button>
+					<button
+						type="button"
+						onClick={() => setColorMode("community")}
+						className={`inline-flex items-center gap-1 rounded px-2 py-0.5 ${colorMode === "community" ? "bg-[var(--inno-surface)] text-[var(--inno-text)] shadow-sm" : "text-[var(--inno-text-subtle)]"}`}
+						title={t("notebook.graph.colorCommunity")}
+						aria-pressed={colorMode === "community"}
+					>
+						<Network size={13} />
+						<span className="hidden @[900px]:inline">{t("notebook.graph.colorCommunity")}</span>
+					</button>
+				</div>
 				<div className="mx-1 h-4 w-px bg-[var(--inno-surface-muted)]" />
 				<span className="text-[var(--inno-text-subtle)]">{t("notebook.graph.show")}</span>
 				{ALL_CATEGORIES.map((cat) => {
@@ -365,20 +607,32 @@ export function GraphView() {
 								className="inline-block h-2.5 w-2.5 shrink-0 rounded-full"
 								style={{ backgroundColor: color, opacity: active ? 1 : 0.4 }}
 							/>
-							<span className="hidden @[680px]:inline">{t(`notebook.types.${cat}`)}</span>
+							<span className="hidden @[1050px]:inline">{t(`notebook.types.${cat}`)}</span>
 						</button>
 					);
 				})}
-				<span className="ml-auto hidden @[680px]:inline">
-					{t("notebook.subtitle", { nodes: visibleNodeCount, edges: visibleEdgeCount })}
-				</span>
+				<div className="ml-auto hidden shrink-0 text-right @[900px]:block">
+					<div>{t("notebook.subtitle", { nodes: visibleNodeCount, edges: visibleEdgeCount })}</div>
+					{colorMode === "community" && state.communities ? (
+						<div className="text-[var(--inno-text-subtle)]">
+							{t("notebook.graph.communityStats", {
+								count: state.communities.count,
+								modularity: state.communities.modularity.toFixed(3),
+							})}
+						</div>
+					) : null}
+				</div>
 			</div>
-			<div ref={containerRef} className="relative min-h-0 flex-1 bg-[var(--inno-workspace-bg,#fafafa)]">
+			<div ref={containerRef} className="relative min-h-0 flex-1 overflow-hidden bg-[var(--inno-workspace-bg,#fafafa)]">
 				{displayNode ? (
 					<div className="absolute inset-x-0 top-0 z-10 flex items-center gap-2 border-b border-[var(--inno-border)] bg-[var(--inno-surface)] px-3 py-1.5 text-xs">
 						<span
 							className="inline-block h-2.5 w-2.5 shrink-0 rounded-full"
-							style={{ backgroundColor: TYPE_COLORS[displayNode.type] ?? "#8b949e" }}
+							style={{
+								backgroundColor: colorMode === "community"
+									? communityColor(displayNode)
+									: TYPE_COLORS[displayNode.type] ?? TYPE_COLORS.tag,
+							}}
 						/>
 						<span className="truncate font-medium text-[var(--inno-text)]">{displayNode.title || displayNode.id}</span>
 						<span className="text-[var(--inno-text-subtle)]">{t(`notebook.types.${displayNode.type}`)}</span>

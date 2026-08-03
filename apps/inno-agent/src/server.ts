@@ -31,7 +31,7 @@ import {
 	applyWorkspaceCwd,
 	setWorkspaceCwdResolver,
 } from "./agent/pi-runner.js";
-import { completePromptOnce, runPromptSerialized, runPromptStreaming, runPromptStreamingInSession, runPromptInSession, abortCurrentPrompt, persistPendingUserTurn } from "./agent/pi-runner.js";
+import { completePromptOnce, runPromptSerialized, runPromptStreamingInSession, runPromptInSession, abortPromptForTurnToken, persistPendingUserTurn, persistCancelledQueuedTurn, type PromptRunOutcome } from "./agent/pi-runner.js";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { ChannelRegistry } from "./channels/channel.js";
 import type { ChannelStreamEvent } from "./channels/channel.js";
@@ -53,7 +53,8 @@ import type { LearnerProfile, LearningGoal, KnowledgeState, Misconception, Learn
 import { randomUUID } from "node:crypto";
 import { logger } from "./logger.js";
 import { applyRuntimeEnvironment, parseRuntimeArgs, resolveRuntimePaths } from "./runtime.js";
-import { questionBridge, type QuestionBridgeResult } from "./agent/question-bridge.js";
+import { questionBridge, type PersistedQuestion, type QuestionBridgeResult } from "./agent/question-bridge.js";
+import { hasCompleteTurnAfterBaseline, streamRegistry, type SessionStreamState, type StreamPersistence } from "./chat/stream-registry.js";
 import { DEFAULT_WORKSPACE_ID, TEMP_WORKSPACE_ID, WorkspaceRegistry } from "./workspace/workspace-registry.js";
 import { listPresets, listRemotePresets, ensurePresetCached, instantiatePreset } from "./presets/preset-store.js";
 import { createContentSource, type RemoteContentSource } from "./content-source/index.js";
@@ -112,34 +113,6 @@ let bootstrapped = false;
 let bootstrapPromise: Promise<void> | null = null;
 let bridgeToken: string | undefined;
 
-// ---------------------------------------------------------------------------
-// Session Event Broadcaster — allows clients to reconnect to in-progress
-// streams after navigating away and back.
-// ---------------------------------------------------------------------------
-
-class SessionEventBroadcaster {
-	private history: unknown[] = [];
-	private subscribers = new Set<(event: unknown) => void>();
-	private _closed = false;
-
-	publish(event: unknown): void {
-		if (this._closed) return;
-		this.history.push(event);
-		for (const sub of this.subscribers) sub(event);
-	}
-
-	subscribe(cb: (event: unknown) => void): () => void {
-		for (const event of this.history) cb(event);
-		if (!this._closed) this.subscribers.add(cb);
-		return () => { this.subscribers.delete(cb); };
-	}
-
-	close(): void { this._closed = true; this.subscribers.clear(); }
-	get closed(): boolean { return this._closed; }
-}
-
-const sessionBroadcasters = new Map<string, SessionEventBroadcaster>();
-
 function piEventToSseEvent(event: any): unknown | null {
 	switch (event.type) {
 		case "message_update": {
@@ -149,13 +122,13 @@ function piEventToSseEvent(event: any): unknown | null {
 			if (ev.type === "toolcall_start" || ev.type === "toolcall_delta" || ev.type === "toolcall_end") {
 				return toolCallStreamEventFromAssistantEvent(ev);
 			}
-			if (ev.type === "error") return { type: "error", message: ev.error.errorMessage || `LLM API error (stopReason: ${ev.error.stopReason})` };
+			if (ev.type === "error") return null;
 			return null;
 		}
 		case "message_end": {
 			const msg = event.message;
 			if (msg && typeof msg === "object" && "stopReason" in msg && msg.stopReason === "error") {
-				return { type: "error", message: msg.errorMessage || "The model request failed." };
+				return null;
 			}
 			return null;
 		}
@@ -466,10 +439,9 @@ function maskSecret(value: string | undefined): string {
  * paths. When the chat model cannot natively recognize images, the agent is
  * steered (via the system prompt) to call `ocr_image` with these paths.
  */
-function persistInlineImages(images: Array<{ data: string; mimeType: string }>): string[] {
+function persistInlineImages(images: Array<{ data: string; mimeType: string }>, workspaceRoot: string): string[] {
 	if (images.length === 0) return [];
-	const workspaceDir = process.env.INNO_WORKSPACE_DIR || process.cwd();
-	const chatImagesDir = join(workspaceDir, ".chat-images");
+	const chatImagesDir = join(workspaceRoot, ".chat-images");
 	try {
 		if (!existsSync(chatImagesDir)) mkdirSync(chatImagesDir, { recursive: true });
 	} catch (err) {
@@ -492,6 +464,54 @@ function persistInlineImages(images: Array<{ data: string; mimeType: string }>):
 	return paths;
 }
 
+function sessionRevision(filePath: string): string {
+	try {
+		const stat = statSync(filePath);
+		return `${stat.size}:${stat.mtimeMs}`;
+	} catch {
+		return "missing";
+	}
+}
+
+function readSessionBaseline(filePath: string): { messageCount: number; revision: string } {
+	return {
+		messageCount: parseSessionFile(filePath)?.messages.length ?? 0,
+		revision: sessionRevision(filePath),
+	};
+}
+
+function confirmTurnPersistence(
+	state: SessionStreamState,
+	sessionPath: string,
+	outcome: PromptRunOutcome,
+): StreamPersistence {
+	const parsed = parseSessionFile(sessionPath);
+	const revision = sessionRevision(sessionPath);
+	if (!parsed) return { persisted: false, finalSessionRevision: revision };
+	const structurallyComplete = hasCompleteTurnAfterBaseline(
+		parsed.messages,
+		state.baselineMessageCount,
+	);
+	const revisionChanged = revision !== state.baselineSessionRevision;
+	const persisted = structurallyComplete && revisionChanged && parsed.messages.length > state.baselineMessageCount;
+	if (!persisted) {
+		logger.error({
+			sessionId: state.sessionId,
+			turnId: state.turnId,
+			outcome: outcome.type,
+			baselineMessageCount: state.baselineMessageCount,
+			finalMessageCount: parsed.messages.length,
+			baselineSessionRevision: state.baselineSessionRevision,
+			finalSessionRevision: revision,
+		}, "chat turn persistence confirmation failed");
+	}
+	return {
+		persisted,
+		finalMessageCount: parsed.messages.length,
+		finalSessionRevision: revision,
+	};
+}
+
 function mimeTypeToExtension(mimeType: string): string {
 	switch (mimeType) {
 		case "image/png": return ".png";
@@ -505,9 +525,11 @@ function mimeTypeToExtension(mimeType: string): string {
 }
 
 /**
- * Prepend a path-hint block to the user prompt when inline images were
- * persisted, so the agent knows which files to pass to `ocr_image` /
- * `parse_document` when the model can't natively see images.
+ * Build the fallback prompt variant carrying the saved-image path hint, so
+ * the agent knows which files to pass to `ocr_image` / `parse_document`.
+ * Only sent when the model can't natively see images (text-only model or a
+ * rejected native payload) — vision-capable turns receive the raw prompt so
+ * they aren't steered toward `ocr_image`.
  */
 function prependImagePathsHint(prompt: string, imagePaths: string[]): string {
 	if (imagePaths.length === 0) return prompt;
@@ -581,6 +603,9 @@ function buildSafeSettings() {
 				model: config.ocrApi.model,
 				baseUrl: config.ocrApi.baseUrl,
 			}
+			: undefined,
+		tavily: config.tavily
+			? { apiKey: maskSecret(config.tavily.apiKey) }
 			: undefined,
 		contentHub: config.contentHub
 			? { ...config.contentHub, token: maskSecret(config.contentHub.token) }
@@ -1778,9 +1803,11 @@ interface SessionSummary {
 	channels: SessionChannel[];
 	/** Immutable birthplace of the session (web/cli/feishu/wechat/scheduler). */
 	origin?: SessionChannel;
+	/** True once a topic (manual or auto-generated) has been recorded. */
+	hasTopic?: boolean;
 }
 
-type SessionTopicMetadata = Record<string, { topic: string; updatedAt: string; generated?: boolean }>;
+type SessionTopicMetadata = Record<string, { topic: string; updatedAt: string; generated?: boolean; upgraded?: boolean }>;
 
 /**
  * Serialize a parsed session (summary + merged messages) into a review-friendly
@@ -1884,9 +1911,9 @@ function readSessionTopicMetadata(): SessionTopicMetadata {
 	return readJson<SessionTopicMetadata>(sessionTopicMetadataPath(), {});
 }
 
-function writeSessionTopic(id: string, topic: string, generated = false): void {
+function writeSessionTopic(id: string, topic: string, generated = false, extra?: { upgraded?: boolean }): void {
 	const metadata = readSessionTopicMetadata();
-	metadata[id] = { topic, generated, updatedAt: new Date().toISOString() };
+	metadata[id] = { topic, generated, updatedAt: new Date().toISOString(), ...(extra?.upgraded ? { upgraded: true } : {}) };
 	writeJson(sessionTopicMetadataPath(), metadata);
 }
 
@@ -2068,6 +2095,29 @@ function sessionArchiveMetadataPath(): string {
 	return join(dataDir, "sessions", "archives.json");
 }
 
+// --- Pending question persistence (survives process restart) ---
+function sessionQuestionMetadataPath(): string {
+	return join(dataDir, "sessions", "questions.json");
+}
+
+type SessionQuestionMetadata = Record<string, PersistedQuestion>;
+
+/** In-memory cache of questions.json — read once, updated on every write.
+ *  Avoids a synchronous readFileSync on every session-detail request. */
+let _questionMetadataCache: SessionQuestionMetadata | null = null;
+
+function readSessionQuestionMetadata(): SessionQuestionMetadata {
+	if (_questionMetadataCache === null) {
+		_questionMetadataCache = readJson<SessionQuestionMetadata>(sessionQuestionMetadataPath(), {});
+	}
+	return _questionMetadataCache;
+}
+
+function writeSessionQuestionMetadata(meta: SessionQuestionMetadata): void {
+	_questionMetadataCache = meta;
+	writeJson(sessionQuestionMetadataPath(), meta);
+}
+
 function readSessionChannelMetadata(): SessionChannelMetadata {
 	return readJson<SessionChannelMetadata>(sessionChannelMetadataPath(), {});
 }
@@ -2129,7 +2179,9 @@ function withRecordedChannels(summary: SessionSummary, metadata: SessionChannelM
 
 function withRecordedTopic(summary: SessionSummary, metadata: SessionTopicMetadata): SessionSummary {
 	const topic = metadata[summary.id]?.topic?.trim();
-	return topic ? { ...summary, name: topic } : summary;
+	// hasTopic lets clients distinguish "no topic recorded yet" (auto-topic may
+	// still be generating) from a fallback preview name, without guessing.
+	return topic ? { ...summary, name: topic, hasTopic: true } : { ...summary, hasTopic: false };
 }
 
 /**
@@ -2159,32 +2211,73 @@ function cleanGeneratedTopic(raw: string): string {
 		.slice(0, 32);
 }
 
+/** Strip machine-injected prefixes (e.g. the image-upload hint prepended to
+ *  user prompts) so titles reflect the user's actual words. */
+function stripInjectedPrefix(content: string): string {
+	return content
+		.replace(/^\[用户本轮上传了 \d+ 张图片，已保存到工作区：[\s\S]*?\]\s*/, "")
+		.trim();
+}
+
 function fallbackTopicFromMessages(messages: SessionMessageSummary[], summary: SessionSummary): string {
-	const source = messages.find((message) => message.role === "user")?.content || summary.preview || summary.name;
+	const source = stripInjectedPrefix(messages.find((message) => message.role === "user")?.content || "") || summary.preview || summary.name;
 	const cleaned = source.replace(/\s+/g, " ").trim();
 	return cleaned ? (cleaned.length > 28 ? `${cleaned.slice(0, 28)}...` : cleaned) : "New conversation";
 }
 
-async function generateSessionTopic(summary: SessionSummary, messages: SessionMessageSummary[]): Promise<string> {
-	const excerpt = messages
-		.slice(0, 4)
-		.map((message) => `${message.role === "user" ? "用户" : "助手"}: ${message.content.replace(/\s+/g, " ").trim()}`)
+/** Build the dialogue excerpt for topic generation: first 2 + last 4 usable
+ *  messages (the opening states the goal, the tail captures where the
+ *  conversation actually went), consecutive duplicates dropped (scheduler
+ *  nudges repeat), machine prefixes stripped, ~2400 chars. */
+function buildTopicExcerpt(messages: SessionMessageSummary[]): string {
+	const usable = messages
+		.map((message) => ({
+			role: message.role,
+			content: stripInjectedPrefix(message.content).replace(/\s+/g, " ").trim(),
+		}))
+		.filter((message) => message.content)
+		.filter((message, index, all) => index === 0 || message.content !== all[index - 1].content);
+	const picked = usable.length <= 6 ? usable : [...usable.slice(0, 2), ...usable.slice(-4)];
+	return picked
+		.map((message) => `${message.role === "user" ? "用户" : "助手"}: ${message.content}`)
 		.join("\n")
-		.slice(0, 800);
+		.slice(0, 2400);
+}
+
+async function generateSessionTopic(summary: SessionSummary, messages: SessionMessageSummary[]): Promise<string> {
+	const excerpt = buildTopicExcerpt(messages);
 
 	if (!excerpt) return fallbackTopicFromMessages(messages, summary);
 
-	const prompt = `请根据下面的对话内容生成一个简短中文话题标题。
+	const prompt = `请用一句简短的中文短语概括下面学习对话中用户的学习目标或任务。
 要求：
 - 只输出标题本身，不要解释
-- 8 到 16 个中文字符左右
+- 8 到 16 个中文字符
+- 聚焦用户想学的内容或要做的任务，忽略寒暄、客套话和系统提示
 - 不要使用引号、句号或冒号
 
+示例一：
 对话：
-${excerpt}`;
+用户: 你好
+助手: 你好！今天想学点什么？
+用户: 我一直搞不清贝叶斯定理，能举个生活中的例子讲讲吗
+标题：贝叶斯定理入门
+
+示例二：
+对话：
+用户: 帮我把这份教案改成 45 分钟公开课的版本
+助手: 好的，我先看看教案的结构……
+标题：教案改编公开课版
+
+对话：
+${excerpt}
+标题：`;
 
 	try {
-		const generated = cleanGeneratedTopic(await completePromptOnce(prompt, 64));
+		// Reasoning models burn tokens on a thinking block before any visible
+		// text — a tiny maxTokens (e.g. 64) gets fully consumed by thinking and
+		// yields an empty title. 1024 leaves ample room for both.
+		const generated = cleanGeneratedTopic(await completePromptOnce(prompt, 1024));
 		return generated || fallbackTopicFromMessages(messages, summary);
 	} catch (err) {
 		return fallbackTopicFromMessages(messages, summary);
@@ -2194,13 +2287,22 @@ ${excerpt}`;
 /**
  * Auto-generate a topic for a session if it doesn't already have one.
  * Runs asynchronously — fire and forget.
+ *
+ * Two passes, both guarded by `_pendingAutoTopics`:
+ * 1. First pass: no topic recorded yet and ≥2 messages (the first exchange).
+ * 2. Upgrade pass: the existing topic is auto-generated (never a manual
+ *    rename), hasn't been upgraded yet, and the conversation has grown to
+ *    TOPIC_UPGRADE_MESSAGE_THRESHOLD messages — the first-pass title was
+ *    based on a single exchange and is often vague, so re-roll it once with
+ *    richer context.
  */
 const _pendingAutoTopics = new Set<string>();
+const TOPIC_UPGRADE_MESSAGE_THRESHOLD = 6;
 
 function maybeAutoGenerateTopic(sessionId: string): void {
 	if (!sessionId || _pendingAutoTopics.has(sessionId)) return;
-	const topicMeta = readSessionTopicMetadata();
-	if (topicMeta[sessionId]) return; // already has a topic
+	const existing = readSessionTopicMetadata()[sessionId];
+	if (existing && (!existing.generated || existing.upgraded)) return;
 
 	const sessionPath = sessionFileFromId(join(dataDir, "sessions"), sessionId);
 	if (!sessionPath || !existsSync(sessionPath)) return;
@@ -2210,9 +2312,10 @@ function maybeAutoGenerateTopic(sessionId: string): void {
 		try {
 			const parsed = parseSessionFile(sessionPath);
 			if (!parsed || parsed.messages.length < 2) return;
+			if (existing && parsed.messages.length < TOPIC_UPGRADE_MESSAGE_THRESHOLD) return;
 			const topic = await generateSessionTopic(parsed.summary, parsed.messages);
-			writeSessionTopic(sessionId, topic, true);
-			logger.info(`[auto-topic] ${sessionId} → ${topic}`);
+			writeSessionTopic(sessionId, topic, true, existing ? { upgraded: true } : undefined);
+			logger.info(`[auto-topic] ${sessionId} → ${topic}${existing ? " (upgraded)" : ""}`);
 		} catch (err) {
 			logger.warn({ err }, `auto-topic generation failed for ${sessionId}`);
 		} finally {
@@ -2880,7 +2983,16 @@ const server = createServer(async (req, res) => {
 				withRecordedChannels(parsed.summary, channelMetadata),
 				topicMetadata,
 			);
-			json(res, 200, { ...summary, messages: parsed.messages });
+			json(res, 200, {
+				...summary,
+				messages: parsed.messages,
+				messageCount: parsed.messages.length,
+				sessionRevision: sessionRevision(sessionPath),
+				// Attach any persisted pending question so the frontend can restore
+				// the card after a full process restart (the in-memory turn and its
+				// event replay are gone by then).
+				pendingQuestion: readSessionQuestionMetadata()[basename(sessionPath)] ?? undefined,
+			});
 			return;
 		}
 
@@ -2926,7 +3038,7 @@ const server = createServer(async (req, res) => {
 				return;
 			}
 			const topic = await generateSessionTopic(parsed.summary, parsed.messages);
-			writeSessionTopic(basename(sessionPath), topic, true);
+			writeSessionTopic(basename(sessionPath), topic, true, { upgraded: true });
 			const summary = withRecordedTopic(
 				withRecordedChannels(parsed.summary, readSessionChannelMetadata()),
 				readSessionTopicMetadata(),
@@ -2999,6 +3111,10 @@ const server = createServer(async (req, res) => {
 		const deleteSessionMatch = matchRoute("DELETE", method, url, "/api/sessions/:id");
 		if (deleteSessionMatch) {
 			const id = decodeURIComponent(deleteSessionMatch.id);
+			if (streamRegistry.getActiveForSession(id)) {
+				json(res, 409, { error: "Cannot delete a session with an active chat turn" });
+				return;
+			}
 			const sessionPath = sessionFileFromId(join(dataDir, "sessions"), id);
 			if (!sessionPath || !existsSync(sessionPath)) {
 				json(res, 404, { error: "Session not found" });
@@ -3034,6 +3150,11 @@ const server = createServer(async (req, res) => {
 				if (archiveMeta[sessionId]) {
 					delete archiveMeta[sessionId];
 					writeJson(sessionArchiveMetadataPath(), archiveMeta);
+				}
+				const questionMeta = readSessionQuestionMetadata();
+				if (questionMeta[sessionId]) {
+					delete questionMeta[sessionId];
+					writeSessionQuestionMetadata(questionMeta);
 				}
 				workspaceRegistry.unbindSession(sessionId);
 				if (shouldDropTempWorkspace) {
@@ -3769,6 +3890,10 @@ const server = createServer(async (req, res) => {
 		const workspaceDeleteMatch = matchRoute("DELETE", method, url.split("?")[0], "/api/workspaces/:id");
 		if (workspaceDeleteMatch) {
 			const id = decodeURIComponent(workspaceDeleteMatch.id);
+			if (streamRegistry.getActiveForWorkspace(id)) {
+				json(res, 409, { error: "Cannot delete a workspace with an active chat turn" });
+				return;
+			}
 			if (id === TEMP_WORKSPACE_ID) {
 				json(res, 400, { error: "Cannot delete the shared tmp workspace" });
 				return;
@@ -3794,6 +3919,10 @@ const server = createServer(async (req, res) => {
 		const sessionWorkspacePutMatch = matchRoute("PUT", method, url, "/api/sessions/:id/workspace");
 		if (sessionWorkspacePutMatch) {
 			const sessionId = decodeURIComponent(sessionWorkspacePutMatch.id);
+			if (streamRegistry.getActiveForSession(sessionId)) {
+				json(res, 409, { error: "Cannot rebind a session with an active chat turn" });
+				return;
+			}
 			const body = (await readBody(req)) as Record<string, unknown>;
 			const workspaceId = typeof body.workspaceId === "string" ? body.workspaceId.trim() : "";
 			if (!workspaceId) { json(res, 400, { error: "Missing workspaceId" }); return; }
@@ -4202,6 +4331,27 @@ const server = createServer(async (req, res) => {
 			return;
 		}
 
+		// --- Tavily settings (web_search tool API key) ---
+		if (method === "PUT" && url === "/api/settings/tavily") {
+			const body = (await readBody(req)) as Record<string, unknown>;
+			if (typeof body.apiKey !== "string") {
+				json(res, 400, { error: "Missing apiKey (string)" });
+				return;
+			}
+			const incoming = body.apiKey.trim();
+			// A masked value (e.g. "****abcd") means "keep the existing key".
+			const apiKey = incoming.startsWith("****") ? (config.tavily?.apiKey ?? "") : incoming;
+			if (!apiKey) {
+				config.tavily = undefined;
+			} else {
+				config.tavily = { apiKey };
+			}
+			config = saveConfig(paths.configPath, config);
+			syncConfig(config);
+			json(res, 200, buildSafeSettings());
+			return;
+		}
+
 		// --- Content Hub settings (source for skill library + presets) ---
 		if (method === "PUT" && url === "/api/settings/content-hub") {
 			const body = (await readBody(req)) as Record<string, unknown>;
@@ -4257,23 +4407,27 @@ const server = createServer(async (req, res) => {
 				.filter((img): img is { data: string; mimeType: string } =>
 					img && typeof img.data === "string" && typeof img.mimeType === "string")
 				.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
-			// Persist inline images to the workspace so file-path tools (ocr_image,
-			// parse_document) can read them when the chat model can't see images.
-			const imagePaths = persistInlineImages(images);
-			const promptWithHint = prependImagePathsHint(prompt, imagePaths);
-			// Use atomic switch+prompt when a specific session is requested.
 			const requestedSessionId = typeof body.sessionId === "string" ? body.sessionId : null;
+			const imageSessionId = requestedSessionId || getCurrentSessionId();
+			const imageWorkspaceId = workspaceRegistry.getSessionWorkspaceId(imageSessionId);
+			const imageWorkspaceRoot = workspaceRegistry.resolveWorkspaceDir(imageWorkspaceId) ?? paths.workspaceDir;
+			const imagePaths = persistInlineImages(images, imageWorkspaceRoot);
+			// Sent only when the images can't reach the model natively (text-only
+			// model or provider rejection); vision turns get the raw prompt so
+			// they aren't steered toward ocr_image.
+			const imageFallbackPrompt = prependImagePathsHint(prompt, imagePaths);
+			// Use atomic switch+prompt when a specific session is requested.
 			let output: string;
 			try {
 				if (requestedSessionId) {
 					const sessionPath = sessionFileFromId(join(dataDir, "sessions"), requestedSessionId);
 					if (sessionPath && existsSync(sessionPath)) {
-						output = await runPromptInSession(sessionPath, promptWithHint, images.length ? images : undefined);
+						output = await runPromptInSession(sessionPath, prompt, images.length ? images : undefined, imageFallbackPrompt);
 					} else {
-						output = await runPromptSerialized(promptWithHint, images.length ? images : undefined);
+						output = await runPromptSerialized(prompt, images.length ? images : undefined, imageFallbackPrompt);
 					}
 				} else {
-					output = await runPromptSerialized(promptWithHint, images.length ? images : undefined);
+					output = await runPromptSerialized(prompt, images.length ? images : undefined, imageFallbackPrompt);
 				}
 			} catch (err) {
 				logger.error({ err, sessionId: requestedSessionId }, "Non-streaming chat LLM call failed");
@@ -4289,38 +4443,84 @@ const server = createServer(async (req, res) => {
 		// --- Question response (from web UI) ---
 		if (method === "POST" && url === "/api/chat/question-response") {
 			const body = (await readBody(req)) as Record<string, unknown>;
+			const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+			const turnId = typeof body.turnId === "string" ? body.turnId : "";
 			const questionId = typeof body.questionId === "string" ? body.questionId : "";
 			const result = body.result as QuestionBridgeResult | undefined;
-			if (!questionId || !result) {
-				json(res, 400, { error: "Missing questionId or result" });
+			if (!sessionId || !turnId || !questionId || !result) {
+				json(res, 400, { error: "Missing sessionId, turnId, questionId or result" });
 				return;
 			}
-			const accepted = questionBridge.respond(questionId, result);
-			json(res, accepted ? 200 : 404, { accepted });
+			const status = questionBridge.respond({ sessionId, turnId, questionId, result });
+			if (status === "not_found") {
+				// The live turn is gone (process restarted, or the turn ended while
+				// the card was parked). If a persisted card matches, consume it and
+				// tell the client to resubmit the answer as a fresh chat turn — the
+				// agent then picks the answer up from the session history.
+				const questionMeta = readSessionQuestionMetadata();
+				const persistedEntry = Object.entries(questionMeta).find(([, q]) => q.questionId === questionId);
+				if (persistedEntry) {
+					delete questionMeta[persistedEntry[0]];
+					writeSessionQuestionMetadata(questionMeta);
+					json(res, 200, { accepted: true, expired: true, sessionId: persistedEntry[0] });
+					return;
+				}
+			}
+			json(res, status === "accepted" ? 200 : status === "scope_mismatch" || status === "already_resolved" ? 409 : 404, { accepted: status === "accepted" });
 			return;
 		}
 
-		// --- Chat Abort (explicit stop from UI) ---
-		// The SSE req.on("close") handler also aborts, but connection-close is
-		// unreliable through dev proxies and during rapid terminate→switch flows.
-		// This gives the client a deterministic way to stop the backend stream so
-		// the shared prompt queue is released immediately (otherwise new-session /
-		// switch-session block behind a still-running turn).
 		if (method === "POST" && url === "/api/chat/abort") {
-			await abortCurrentPrompt();
-			json(res, 200, { aborted: true });
+			json(res, 400, { error: "Scoped abort requires sessionId and turnId" });
 			return;
 		}
 
-		// --- Chat Events Reconnect (SSE) ---
-		// Allows a client that navigated away to reconnect to an in-progress
-		// session's event stream and replay all events from the beginning.
+		const chatAbortMatch = matchRoute("POST", method, url, "/api/chat/:sessionId/:turnId/abort");
+		if (chatAbortMatch) {
+			const state = streamRegistry.getByTurn(chatAbortMatch.turnId);
+			if (!state || state.sessionId !== chatAbortMatch.sessionId) {
+				json(res, 404, { error: "Chat turn not found" });
+				return;
+			}
+			if (state.status !== "queued" && state.status !== "running") {
+				json(res, 200, { status: state.status, cancelRequested: state.cancelRequested });
+				return;
+			}
+			streamRegistry.requestCancel(state);
+			// Resolve a parked ask_user_question before aborting: session.abort()
+			// alone cannot wake the agent loop while it awaits the question
+			// promise, so the turn (and its queue slot) would stay stuck until
+			// the 30-minute question timeout. unbindTurn is idempotent — the
+			// onFinish unbind becomes a no-op once the binding is cleared here.
+			questionBridge.unbindTurn({ sessionId: state.sessionId, turnId: state.turnId, reason: "cancelled" });
+			if (state.status === "running") await abortPromptForTurnToken(state.turnId);
+			json(res, 202, { status: state.status, cancelRequested: true });
+			return;
+		}
+
+		const chatStatusMatch = matchRoute("GET", method, url, "/api/chat/status/:sessionId");
+		if (chatStatusMatch) {
+			streamRegistry.cleanupExpiredTurns();
+			const state = streamRegistry.getLatest(chatStatusMatch.sessionId);
+			json(res, 200, state
+				? { found: true, stream: streamRegistry.toPublicSnapshot(state) }
+				: { found: false });
+			return;
+		}
+
 		const chatEventsMatch = matchRoute("GET", method, url, "/api/chat/events/:id");
 		if (chatEventsMatch) {
 			const sessionId = chatEventsMatch.id;
-			const bc = sessionBroadcasters.get(sessionId);
-			if (!bc) {
-				json(res, 404, { error: "No active stream" });
+			const params = new URL(url, "http://localhost").searchParams;
+			const turnId = params.get("turnId") ?? "";
+			const after = Number.parseInt(params.get("after") ?? "0", 10);
+			if (!turnId || !Number.isFinite(after) || after < 0) {
+				json(res, 400, { error: "turnId and a non-negative after value are required" });
+				return;
+			}
+			const state = streamRegistry.getByTurn(turnId);
+			if (!state || state.sessionId !== sessionId) {
+				json(res, 404, { error: "Chat turn not found" });
 				return;
 			}
 			res.writeHead(200, {
@@ -4340,22 +4540,20 @@ const server = createServer(async (req, res) => {
 					}
 				}
 			}, 15_000);
-			const unsub = bc.subscribe((event: unknown) => {
+			const finishResponse = () => {
 				if (ended) return;
-				res.write(`data: ${JSON.stringify(event)}\n\n`);
-				if ((event as any).type === "done" || ((event as any).type === "error" && !(event as any).toolCallId)) {
-					clearInterval(eventsHeartbeat);
-					res.write("data: [DONE]\n\n");
-					ended = true;
-					res.end();
-				}
-			});
-			if (bc.closed && !ended) {
+				ended = true;
 				clearInterval(eventsHeartbeat);
 				res.write("data: [DONE]\n\n");
 				res.end();
-			}
-			req.on("close", () => { clearInterval(eventsHeartbeat); unsub(); });
+			};
+			const unsub = streamRegistry.subscribe(state, after, (envelope) => {
+				if (ended) return;
+				res.write(`data: ${JSON.stringify(envelope)}\n\n`);
+				if (["done", "error", "aborted"].includes(envelope.event.type)) finishResponse();
+			});
+			if (state.terminalEventPublished && !ended) finishResponse();
+			res.on("close", () => { clearInterval(eventsHeartbeat); unsub(); });
 			return;
 		}
 
@@ -4363,8 +4561,25 @@ const server = createServer(async (req, res) => {
 		if (method === "POST" && url === "/api/chat/stream") {
 			const body = (await readBody(req)) as Record<string, unknown>;
 			const prompt = body.prompt as string | undefined;
-			if (!prompt) {
-				json(res, 400, { error: "Missing prompt" });
+			const requestedSessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+			const clientRequestId = typeof body.clientRequestId === "string" ? body.clientRequestId : "";
+			if (!prompt || !requestedSessionId || !clientRequestId) {
+				json(res, 400, { error: "Missing prompt, sessionId or clientRequestId" });
+				return;
+			}
+			if (streamRegistry.getActiveForSession(requestedSessionId)) {
+				json(res, 409, { error: "Session already has an active chat turn" });
+				return;
+			}
+			const targetSessionPath = sessionFileFromId(join(dataDir, "sessions"), requestedSessionId);
+			if (!targetSessionPath || !existsSync(targetSessionPath)) {
+				json(res, 404, { error: "Session not found" });
+				return;
+			}
+			const streamWorkspaceId = workspaceRegistry.getSessionWorkspaceId(requestedSessionId);
+			const streamWorkspaceRoot = workspaceRegistry.resolveWorkspaceDir(streamWorkspaceId);
+			if (!streamWorkspaceRoot) {
+				json(res, 404, { error: "Session workspace not found" });
 				return;
 			}
 			const rawImages = Array.isArray(body.images) ? body.images : [];
@@ -4374,20 +4589,33 @@ const server = createServer(async (req, res) => {
 				.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
 			// Persist inline images to the workspace so file-path tools (ocr_image,
 			// parse_document) can read them when the chat model can't see images.
-			const imagePaths = persistInlineImages(images);
-			const promptWithHint = prependImagePathsHint(prompt, imagePaths);
+			const imagePaths = persistInlineImages(images, streamWorkspaceRoot);
+			// Sent only when the images can't reach the model natively (text-only
+			// model or provider rejection); vision turns get the raw prompt so
+			// they aren't steered toward ocr_image.
+			const imageFallbackPrompt = prependImagePathsHint(prompt, imagePaths);
 			const imageArgs = images.length ? images : undefined;
-
-			// Resolve target session path for atomic switch+stream.
-			const requestedSessionId = typeof body.sessionId === "string" ? body.sessionId : null;
-			let targetSessionPath: string | null = null;
-			if (requestedSessionId) {
-				const sessionPath = sessionFileFromId(join(dataDir, "sessions"), requestedSessionId);
-				if (sessionPath && existsSync(sessionPath)) {
-					targetSessionPath = sessionPath;
-				}
+			const baseline = readSessionBaseline(targetSessionPath);
+			let state: SessionStreamState;
+			try {
+				state = streamRegistry.createTurn({
+					sessionId: requestedSessionId,
+					clientRequestId,
+					workspaceId: streamWorkspaceId,
+					workspaceRoot: streamWorkspaceRoot,
+					inputSnapshot: {
+						prompt,
+						submittedAt: new Date().toISOString(),
+						images: imagePaths.map((workspacePath, index) => ({ mimeType: images[index]?.mimeType ?? "image/png", workspacePath })),
+					},
+					baselineMessageCount: baseline.messageCount,
+					baselineSessionRevision: baseline.revision,
+				});
+			} catch {
+				json(res, 409, { error: "Session already has an active chat turn" });
+				return;
 			}
-			const capturedSessionId = requestedSessionId || getCurrentSessionId();
+			streamRegistry.publishStreamEvent(state, { type: "stream_state", status: "queued" });
 
 			res.writeHead(200, {
 				"Content-Type": "text/event-stream",
@@ -4396,44 +4624,39 @@ const server = createServer(async (req, res) => {
 				"X-Accel-Buffering": "no",
 			});
 
-			const sseWrite = (data: unknown) => {
-				res.write(`data: ${JSON.stringify(data)}\n\n`);
-			};
-
-			let aborted = false;
+			let disconnected = false;
+			let responseEnded = false;
 
 			const heartbeatInterval = setInterval(() => {
-				if (!aborted) {
+				if (!disconnected && !responseEnded) {
 					try {
 						res.write(": heartbeat\n\n");
-						logger.debug({ sessionId: capturedSessionId }, "SSE heartbeat sent");
+						logger.debug({ sessionId: requestedSessionId, turnId: state.turnId }, "SSE heartbeat sent");
 					} catch (err) {
-						logger.warn({ sessionId: capturedSessionId, err }, "SSE heartbeat write failed");
+						logger.warn({ sessionId: requestedSessionId, turnId: state.turnId, err }, "SSE heartbeat write failed");
 					}
 				}
 			}, 15_000);
-
-			req.on("close", () => {
-				aborted = true;
+			const finishResponse = () => {
+				if (responseEnded || disconnected) return;
+				responseEnded = true;
 				clearInterval(heartbeatInterval);
-				questionBridge.setEmitter(null);
-				questionBridge.cancel();
+				res.write("data: [DONE]\n\n");
+				res.end();
+			};
+			const unsubscribeResponse = streamRegistry.subscribe(state, 0, (envelope) => {
+				if (disconnected || responseEnded) return;
+				res.write(`data: ${JSON.stringify(envelope)}\n\n`);
+				if (["done", "error", "aborted"].includes(envelope.event.type)) finishResponse();
+			});
+			res.on("close", () => {
+				disconnected = true;
+				clearInterval(heartbeatInterval);
+				unsubscribeResponse();
 			});
 
-			questionBridge.setEmitter(sseWrite);
-
-			// Create a broadcaster for this session so clients can reconnect
-			// to the event stream after navigating away.
-			const broadcaster = new SessionEventBroadcaster();
-			sessionBroadcasters.set(capturedSessionId, broadcaster);
-			const publishStreamEvent = (event: unknown) => {
-				broadcaster.publish(event);
-				if (!aborted) sseWrite(event);
-			};
-
-			const streamWorkspaceId = workspaceRegistry.getSessionWorkspaceId(capturedSessionId);
-			const streamWorkspaceRoot = workspaceRegistry.resolveWorkspaceDir(streamWorkspaceId);
-			const workspaceChangeMonitor = createWorkspaceChangeMonitor(streamWorkspaceRoot, publishStreamEvent);
+			let workspaceChangeMonitor: ReturnType<typeof createWorkspaceChangeMonitor> = null;
+			const closeWorkspaceChangeMonitor = () => workspaceChangeMonitor?.close();
 
 			// Track whether the model API surfaced an error this turn. The PI SDK
 			// does NOT throw on model API errors (e.g. HTTP 413 from an over-long
@@ -4441,7 +4664,6 @@ const server = createServer(async (req, res) => {
 			// stopReason "error" + errorMessage, delivered via message_end. If we
 			// don't forward that, runPromptStreaming resolves with empty text and
 			// the UI shows nothing. So we detect it here and emit an error event.
-			let emittedError = false;
 			let promptStartTime = 0;
 			const onEvent = (event: import("@earendil-works/pi-coding-agent").AgentSessionEvent) => {
 				// Logging regardless of aborted state
@@ -4460,7 +4682,6 @@ const server = createServer(async (req, res) => {
 							msg && typeof msg === "object" && "stopReason" in msg &&
 							(msg as { stopReason?: string }).stopReason === "error"
 						) {
-							emittedError = true;
 							const detail = (msg as { errorMessage?: string }).errorMessage;
 							const errorMsg = detail || "The model request failed.";
 							logger.error({ stopReason: "error", errorMessage: errorMsg, message: msg, elapsedMs: Date.now() - promptStartTime }, "Model request failed (message_end stopReason=error)");
@@ -4507,59 +4728,90 @@ const server = createServer(async (req, res) => {
 
 				// Convert to an SSE event and publish to broadcaster + live client.
 				const sseEvent = piEventToSseEvent(event);
-				if (sseEvent) publishStreamEvent(sseEvent);
+				if (sseEvent) streamRegistry.publishStreamEvent(state, sseEvent as { type: string });
 			};
 
 			promptStartTime = Date.now();
 			try {
-				// Use atomic switch+stream when a specific session is requested,
-				// preventing race conditions with channel session switches.
-				const fullText = targetSessionPath
-					? await runPromptStreamingInSession(targetSessionPath, promptWithHint, onEvent, imageArgs)
-					: await runPromptStreaming(promptWithHint, onEvent, imageArgs);
-				const doneEvent = { type: "done", fullText };
-				broadcaster.publish(doneEvent);
-				if (!aborted) sseWrite(doneEvent);
-				// Skip topic auto-generation when the turn errored — there is no
-				// meaningful assistant reply to summarize and the model API is
-				// likely still failing (which would just block again).
-				if (!emittedError) maybeAutoGenerateTopic(capturedSessionId);
+				await runPromptStreamingInSession(targetSessionPath, prompt, onEvent, imageArgs, {
+					token: state.turnId,
+					shouldStart: () => !state.cancelRequested,
+					isCancellationRequested: () => state.cancelRequested,
+					onStart: () => {
+						streamRegistry.publishStreamEvent(state, { type: "stream_state", status: "running" });
+						questionBridge.bindTurn({
+							sessionId: state.sessionId,
+							turnId: state.turnId,
+							emit: (event) => streamRegistry.publishStreamEvent(state, event),
+							timeoutMs: 30 * 60_000,
+						});
+						workspaceChangeMonitor = createWorkspaceChangeMonitor(streamWorkspaceRoot, (event) => {
+							streamRegistry.publishStreamEvent(state, event as { type: string });
+						});
+					},
+					onFinish: async (outcome) => {
+						if (outcome.type === "aborted" && outcome.reason === "cancelled_before_start") {
+							persistCancelledQueuedTurn(prompt, state.sessionId, imageArgs);
+						} else if (outcome.type !== "completed") {
+							persistPendingUserTurn(state.sessionId);
+						}
+						const persistence = confirmTurnPersistence(state, targetSessionPath, outcome);
+						questionBridge.unbindTurn({ sessionId: state.sessionId, turnId: state.turnId, reason: outcome.type });
+						closeWorkspaceChangeMonitor();
+						workspaceChangeMonitor = null;
+						recordCurrentSessionChannel("web", state.sessionId, { setOriginIfEmpty: true });
+						if (outcome.type === "completed" && persistence.persisted) {
+							streamRegistry.finishTurn(state, "completed", { type: "done", fullText: outcome.fullText }, persistence);
+							maybeAutoGenerateTopic(state.sessionId);
+						} else if (outcome.type === "completed") {
+							streamRegistry.finishTurn(state, "error", { type: "error", message: "Final chat history could not be confirmed.", code: "persistence_confirmation_failed" }, persistence);
+						} else if (outcome.type === "aborted") {
+							streamRegistry.finishTurn(state, "aborted", { type: "aborted", message: "Stopped by user" }, persistence);
+						} else {
+							const message = outcome.error instanceof Error ? outcome.error.message : "Unknown error";
+							if (state.status === "queued") {
+								streamRegistry.finishTurn(state, "aborted", { type: "aborted", message: `Prompt failed before start: ${message}` }, persistence);
+							} else {
+								streamRegistry.finishTurn(state, "error", { type: "error", message }, persistence);
+							}
+						}
+					},
+					onFinalizeFailure: async (outcome, error) => {
+						try {
+							logger.error({ error, outcome: outcome.type, sessionId: state.sessionId, turnId: state.turnId }, "chat turn finalization failed");
+						} catch {
+							// Observability must not block the forced terminal path.
+						}
+						try {
+							questionBridge.unbindTurn({ sessionId: state.sessionId, turnId: state.turnId, reason: "finalization_failed" });
+						} catch {
+							// Continue to the unique terminal event even if question cleanup fails.
+						}
+						try {
+							closeWorkspaceChangeMonitor();
+						} catch {
+							// Continue to the unique terminal event even if monitor cleanup fails.
+						}
+						workspaceChangeMonitor = null;
+						if (!state.terminalEventPublished) {
+							const message = error instanceof Error ? error.message : "Finalization failed";
+							if (state.status === "queued") {
+								streamRegistry.finishTurn(state, "aborted", { type: "aborted", message: `Prompt failed before start: ${message}` }, { persisted: false });
+							} else {
+								streamRegistry.finishTurn(state, "error", { type: "error", message, code: "finalization_failed" }, { persisted: false });
+							}
+						}
+					},
+				}, streamWorkspaceRoot, imageFallbackPrompt);
 			} catch (err) {
-				logger.error({ err }, "SSE stream error");
-				const errorEvent = { type: "error", message: err instanceof Error ? err.message : "Unknown error" };
-				broadcaster.publish(errorEvent);
-				if (!aborted) {
-					sseWrite(errorEvent);
-				}
+				logger.error({ err, sessionId: state.sessionId, turnId: state.turnId }, "SSE chat turn failed");
 			} finally {
 				clearInterval(heartbeatInterval);
-				workspaceChangeMonitor?.close();
-				// Always attribute this turn to the web channel — even on abort or
-				// error — so an interrupted first prompt keeps origin "web" instead
-				// of being mislabeled "cli" (which happens when no channels.json
-				// entry exists) and grouped/lost incorrectly in the sidebar.
-				recordCurrentSessionChannel("web", capturedSessionId, { setOriginIfEmpty: true });
-				// If the turn was interrupted before any assistant content was
-				// committed, the PI SDK never flushes the session to disk (it stays
-				// header-only / 0-byte), so the conversation disappears once the user
-				// switches away. Force a flush of the header + user message so the
-				// session stays in the sidebar and can be reopened. No-op when an
-				// assistant message already exists (normal/errored turns).
-				persistPendingUserTurn(capturedSessionId);
-				// Keep the broadcaster alive for 5 minutes so reconnecting
-				// clients (e.g. after gateway timeout) can replay event history.
-				setTimeout(() => {
-					if (sessionBroadcasters.get(capturedSessionId) === broadcaster) {
-						broadcaster.close();
-						sessionBroadcasters.delete(capturedSessionId);
-					}
-				}, 300_000);
+				closeWorkspaceChangeMonitor();
+				unsubscribeResponse();
+				streamRegistry.cleanupExpiredTurns();
 			}
-			if (!aborted) {
-				res.write("data: [DONE]\n\n");
-			}
-			questionBridge.setEmitter(null);
-			res.end();
+			finishResponse();
 			return;
 		}
 
@@ -4685,6 +4937,23 @@ function bindTerminalWs(ws: WebSocket, terminalId: string): void {
 // Start listening immediately — /health and static files work right away.
 // All other endpoints call ensureBootstrapped() lazily on first request.
 // ---------------------------------------------------------------------------
+
+// Inject persistence callbacks into questionBridge so pending question cards
+// survive a full process restart.
+questionBridge.setPersistence({
+	save: (sessionId, question) => {
+		const meta = readSessionQuestionMetadata();
+		meta[sessionId] = question;
+		writeSessionQuestionMetadata(meta);
+	},
+	remove: (sessionId) => {
+		const meta = readSessionQuestionMetadata();
+		if (sessionId in meta) {
+			delete meta[sessionId];
+			writeSessionQuestionMetadata(meta);
+		}
+	},
+});
 
 server.listen(port, () => {
 	console.log(`[inno-server] listening on http://localhost:${port}`);

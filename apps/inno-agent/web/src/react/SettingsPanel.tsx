@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useTranslation } from "react-i18next";
-import { Trash2, Pencil, X, ChevronDown, ChevronRight, Plus, QrCode as QrCodeIcon, CheckCircle, Wifi, WifiOff, Database, KeyRound } from "lucide-react";
+import { Trash2, Pencil, X, ChevronDown, ChevronRight, Plus, QrCode as QrCodeIcon, CheckCircle, Wifi, WifiOff, Database, KeyRound, Globe } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 import { getWikiStats } from "../api/wiki.js";
 import { settingsStore } from "../stores/settings-store.js";
@@ -182,6 +182,7 @@ function ModelEditForm({ model, settings, onClose }: {
 				<label className="flex items-center gap-1.5"><input type="checkbox" className={checkboxCls} checked={form.makeDefault} onChange={(e) => setForm({ ...form, makeDefault: e.target.checked })} /> {t("settings.form.makeDefault")}</label>
 				<label className="flex items-center gap-1.5"><input type="checkbox" className={checkboxCls} checked={form.preserveApiKey} onChange={(e) => setForm({ ...form, preserveApiKey: e.target.checked })} /> {t("settings.form.preserveApiKey")}</label>
 			</div>
+			<p className="mt-1 text-[10px] text-[var(--inno-text-subtle)]">{t("settings.form.supportsImagesHint")}</p>
 			{formError ? <div className="mt-2 rounded bg-[var(--inno-danger-bg)] px-2 py-1 text-xs text-[var(--inno-danger)]">{formError}</div> : null}
 			<div className="mt-2 flex gap-2">
 				<button className="rounded-md inno-primary-button px-3 py-1.5 text-xs text-white disabled:opacity-50" disabled={saving} onClick={() => void handleSave()}>
@@ -333,6 +334,7 @@ function NewProviderForm() {
 						<label className="flex items-center gap-1.5"><input type="checkbox" className={checkboxCls} checked={form.bypassProxy} onChange={(e) => setForm({ ...form, bypassProxy: e.target.checked })} /> {t("settings.form.bypassProxy")}</label>
 						<label className="flex items-center gap-1.5"><input type="checkbox" className={checkboxCls} checked={form.makeDefault} onChange={(e) => setForm({ ...form, makeDefault: e.target.checked })} /> {t("settings.form.makeDefault")}</label>
 					</div>
+					<p className="mt-1 text-[10px] text-[var(--inno-text-subtle)]">{t("settings.form.supportsImagesHint")}</p>
 					{formError ? <div className="mt-2 rounded bg-[var(--inno-danger-bg)] px-2 py-1 text-xs text-[var(--inno-danger)]">{formError}</div> : null}
 					{saveMessage ? <div className="mt-2 rounded bg-[var(--inno-success-bg)] px-2 py-1 text-xs text-[var(--inno-success)]">{saveMessage}</div> : null}
 					<button className="mt-3 rounded-md inno-primary-button px-3 py-1.5 text-xs text-white disabled:opacity-50" disabled={saving} onClick={() => void handleSave()}>
@@ -1036,6 +1038,111 @@ function OcrSettings({ settings }: { settings: InnoSettings }) {
 	);
 }
 
+/* ---------- Tavily Settings (web_search tool API key) ---------- */
+
+function TavilySettings({ settings }: { settings: InnoSettings }) {
+	const { t } = useTranslation();
+	const tavily = settings.tavily;
+	const [open, setOpen] = useState(false);
+	const [apiKey, setApiKey] = useState("");
+	const [saving, setSaving] = useState(false);
+	const [saved, setSaved] = useState(false);
+
+	const maskedKey = tavily?.apiKey ?? "";
+	const hasExistingKey = Boolean(maskedKey);
+	const [keyDirty, setKeyDirty] = useState(false);
+
+	useEffect(() => {
+		setApiKey("");
+		setKeyDirty(false);
+		setSaved(false);
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [maskedKey]);
+
+	const dirty = keyDirty;
+
+	async function handleSave() {
+		setSaving(true);
+		setSaved(false);
+		try {
+			await settingsStore.saveTavily(keyDirty ? apiKey.trim() : maskedKey);
+			setSaved(true);
+			setApiKey("");
+			setKeyDirty(false);
+		} catch {
+			// error surfaced via store
+		} finally {
+			setSaving(false);
+		}
+	}
+
+	async function handleClear() {
+		setSaving(true);
+		setSaved(false);
+		try {
+			await settingsStore.saveTavily("");
+			setSaved(true);
+			setApiKey("");
+			setKeyDirty(false);
+		} catch {
+			// error surfaced via store
+		} finally {
+			setSaving(false);
+		}
+	}
+
+	return (
+		<div className="min-w-0 rounded-lg bg-[var(--inno-surface)] p-4">
+			<button className="inno-settings-card-toggle flex w-full min-w-0 items-start gap-2 text-left" onClick={() => setOpen((v) => !v)}>
+				<Globe size={16} className="mt-0.5 shrink-0 text-[var(--inno-text)]" />
+				<div className="min-w-0 flex-1">
+					<h4 className="break-words text-sm font-medium text-[var(--inno-text)]">{t("settings.tavily.title", "联网搜索 (Tavily)")}</h4>
+					<p className="mt-1 max-w-full break-words text-xs leading-relaxed text-[var(--inno-text-muted)]">
+						{t("settings.tavily.desc", "为 agent 提供联网检索能力。需在 tavily.com 获取 API Key。")}
+					</p>
+					{!open && (
+						<p className="mt-1 break-all text-[11px] leading-relaxed text-[var(--inno-text-subtle)]">
+							{hasExistingKey ? `apiKey: ${maskedKey}` : t("settings.tavily.placeholder", "tvly-…")}
+						</p>
+					)}
+				</div>
+				<ChevronDown size={14} className={`mt-1 shrink-0 text-[var(--inno-text-subtle)] transition-transform ${open ? "rotate-180" : ""}`} />
+			</button>
+
+			{open ? (
+				<div className="mt-3 grid gap-2.5">
+					<input
+						className={inputCls}
+						type="password"
+						value={apiKey}
+						onChange={(e) => { setApiKey(e.target.value); setKeyDirty(true); setSaved(false); }}
+						placeholder={hasExistingKey ? maskedKey : (t("settings.tavily.placeholder", "tvly-…") ?? "")}
+						autoComplete="off"
+					/>
+					<div className="flex min-w-0 flex-wrap items-center gap-2">
+						<button
+							disabled={saving || !dirty}
+							onClick={() => void handleSave()}
+							className="flex h-8 shrink-0 items-center rounded-md inno-primary-button px-3 text-xs text-white disabled:opacity-50"
+						>
+							{saving ? t("common.loading") : saved ? t("settings.tavily.saved", "已保存") : t("common.save")}
+						</button>
+						{hasExistingKey && (
+							<button
+								disabled={saving}
+								onClick={() => void handleClear()}
+								className="flex h-8 shrink-0 items-center rounded-md border border-[var(--inno-border)] px-3 text-xs text-[var(--inno-text-muted)] hover:bg-[var(--inno-surface-muted)] hover:text-[var(--inno-text)]"
+							>
+								{t("settings.tavily.clear", "清除")}
+							</button>
+						)}
+					</div>
+				</div>
+			) : null}
+		</div>
+	);
+}
+
 /* ---------- Memory Settings (L1/L2/L3 layer toggles) ---------- */
 
 type MemoryLayer = "l1Enabled" | "l2Enabled" | "l3Enabled";
@@ -1318,6 +1425,9 @@ export function SettingsPanel() {
 
 						{/* OCR API (Baidu PaddleOCR-VL token for image text extraction) */}
 						{state.settings && <OcrSettings settings={state.settings} />}
+
+					{/* Tavily (web_search tool API key) */}
+					{state.settings && <TavilySettings settings={state.settings} />}
 
 						{/* Channels Settings */}
 						{state.settings && <ChannelsSettings settings={state.settings} />}

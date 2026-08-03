@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { motion } from "motion/react";
 import { useTranslation } from "react-i18next";
@@ -19,6 +19,7 @@ import type { PresetMeta } from "../types/presets.js";
 import { arrayBufferToBase64 } from "../api/uploads.js";
 import { uploadWorkspaceFiles } from "../api/workspace.js";
 import { normalizeMarkdownMath } from "../utils/markdown-math.js";
+import { splitStreamingMarkdown } from "../utils/markdown-blocks.js";
 import { groupByCategory, matchesQuery } from "../utils/category-grouping.js";
 import { useStoreSnapshot } from "./hooks.js";
 import { QuestionDialog } from "./QuestionDialog.js";
@@ -32,6 +33,105 @@ const PASTE_COLLAPSE_LINES = 20;
 const PASTE_COLLAPSE_CHARS = 2000;
 const LONG_ASSISTANT_CHARS = 6000;
 const LONG_ASSISTANT_LINES = 140;
+
+// Inline chat images are sent to the provider as base64 inside the JSON body.
+// Full-resolution photos (3–10 MB, +33% once base64-encoded) blow past the
+// body-size limit of reverse proxies in front of providers (nginx defaults to
+// 1 MB) and come back as HTTP 413, silently demoting the turn to the OCR
+// fallback. Downscale/re-encode before sending so native vision turns
+// actually reach the model. The target is deliberately well under 1 MB:
+// base64 inflates ~4/3 and the body also carries the system prompt and
+// conversation history.
+const INLINE_IMAGE_MAX_DIMENSION = 1280;
+const INLINE_IMAGE_TARGET_BYTES = 380 * 1024;
+const INLINE_IMAGE_MAX_BYTES = 500 * 1024;
+
+type PreparedInlineImage = InlineImage & { name: string; previewUrl: string };
+
+function rawInlineImage(file: File, dataUrl: string): PreparedInlineImage {
+	const commaIdx = dataUrl.indexOf(",");
+	const header = dataUrl.slice(0, commaIdx);
+	return {
+		data: dataUrl.slice(commaIdx + 1),
+		mimeType: header.match(/:(.*?);/)?.[1] ?? file.type,
+		name: file.name || "image",
+		previewUrl: dataUrl,
+	};
+}
+
+/** Binary size estimate of a base64 data URL payload. */
+function dataUrlBytes(dataUrl: string): number {
+	return Math.floor((dataUrl.length - dataUrl.indexOf(",") - 1) * 3 / 4);
+}
+
+/**
+ * Re-encode as JPEG, shrinking quality first and then dimensions until the
+ * payload fits INLINE_IMAGE_TARGET_BYTES. Returns the smallest result even
+ * when the target can't be reached.
+ */
+function downscaleToFit(img: HTMLImageElement): string | undefined {
+	const canvas = document.createElement("canvas");
+	const ctx = canvas.getContext("2d");
+	if (!ctx) return undefined;
+	let scale = Math.min(1, INLINE_IMAGE_MAX_DIMENSION / Math.max(img.naturalWidth, img.naturalHeight));
+	let quality = 0.8;
+	let best: string | undefined;
+	for (let attempt = 0; attempt < 5; attempt++) {
+		canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+		canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+		// Flatten alpha onto white — JPEG has no transparency.
+		ctx.fillStyle = "#ffffff";
+		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+		const outUrl = canvas.toDataURL("image/jpeg", quality);
+		if (!best || outUrl.length < best.length) best = outUrl;
+		if (dataUrlBytes(outUrl) <= INLINE_IMAGE_TARGET_BYTES) break;
+		if (quality > 0.5) {
+			quality -= 0.15;
+		} else {
+			scale *= 0.75;
+			quality = 0.7;
+		}
+	}
+	return best;
+}
+
+async function prepareInlineImage(file: File): Promise<PreparedInlineImage> {
+	const dataUrl = await new Promise<string>((resolve, reject) => {
+		const reader = new FileReader();
+		reader.onload = () => resolve(reader.result as string);
+		reader.onerror = () => reject(reader.error);
+		reader.readAsDataURL(file);
+	});
+	const passthrough = () => rawInlineImage(file, dataUrl);
+	if (file.size <= INLINE_IMAGE_MAX_BYTES) return passthrough();
+	try {
+		const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+			// `Image` the DOM constructor is shadowed by the lucide icon import.
+			const el = document.createElement("img");
+			el.onload = () => resolve(el);
+			el.onerror = () => reject(new Error("image decode failed"));
+			el.src = dataUrl;
+		});
+		const outUrl = downscaleToFit(img);
+		// Keep the original if re-encoding failed or produced a larger payload.
+		if (!outUrl || outUrl.length >= dataUrl.length) return passthrough();
+		return {
+			data: outUrl.slice(outUrl.indexOf(",") + 1),
+			mimeType: "image/jpeg",
+			name: file.name || "image",
+			previewUrl: outUrl,
+		};
+	} catch {
+		return passthrough();
+	}
+}
+
+interface PendingUpload {
+	fileName: string;
+	path: string;
+	file: File;
+}
 
 const CHANNEL_BADGE_CLASS: Record<string, string> = {
 	cli: "bg-[var(--inno-surface-muted)] text-[var(--inno-text-muted)]",
@@ -117,9 +217,12 @@ function AssistantContent({ content }: { content: string }) {
 	const { t } = useTranslation();
 	const [expanded, setExpanded] = useState(false);
 	const trimmed = content.trim();
+	// normalizeMarkdownMath is a multi-regex full-text scan — cache it so
+	// unrelated re-renders (e.g. streaming emits) don't re-scan old messages.
+	const normalized = useMemo(() => normalizeMarkdownMath(trimmed), [trimmed]);
 	if (!trimmed) return null;
 	if (!shouldCollapseAssistantContent(trimmed)) {
-		return <markdown-artifact content={normalizeMarkdownMath(trimmed)} />;
+		return <markdown-artifact content={normalized} />;
 	}
 	const lineCount = trimmed.split(/\r\n|\r|\n/).length;
 	const preview = trimmed.slice(0, 900);
@@ -132,7 +235,7 @@ function AssistantContent({ content }: { content: string }) {
 			</div>
 			{expanded ? (
 				<div className="max-h-[60vh] overflow-auto rounded border border-[var(--inno-border)] bg-[var(--inno-surface)] p-2">
-					<markdown-artifact content={normalizeMarkdownMath(trimmed)} />
+					<markdown-artifact content={normalized} />
 				</div>
 			) : (
 				<pre className="max-h-36 overflow-hidden whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-[var(--inno-text-muted)] [overflow-wrap:anywhere]">
@@ -172,7 +275,7 @@ function ToolRecordDetails({ tool, className }: { tool: ChatToolRecord; classNam
 	);
 }
 
-function MessageBubble({ message, showChannel }: { message: ChatMessage; showChannel?: boolean }) {
+const MessageBubble = memo(function MessageBubble({ message, showChannel }: { message: ChatMessage; showChannel?: boolean }) {
 	const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
 
 	if (message.role === "user") {
@@ -242,6 +345,108 @@ function MessageBubble({ message, showChannel }: { message: ChatMessage; showCha
 				) : null}
 			</div>
 		</motion.div>
+	);
+});
+
+/**
+ * Memoized artifact for one closed block of a streaming reply. Closed blocks
+ * never change, so they are parsed by marked/KaTeX exactly once and never
+ * re-render — which also keeps the bubble's height monotonically growing
+ * (no re-parse shrink that could yank the scroll position upwards).
+ */
+const StableStreamingMarkdown = memo(function StableStreamingMarkdown({ content }: { content: string }) {
+	return <markdown-artifact content={content} />;
+});
+
+/**
+ * Live-stream bubbles (thinking + reply text). Subscribes to the chat store
+ * independently so the high-frequency text flushes re-render only this small
+ * subtree, not the whole message list.
+ */
+function StreamingBubbles() {
+	const { t } = useTranslation();
+	const stream = useStoreSnapshot(chatStore, () => ({
+		text: chatStore.streamingText,
+		thinking: chatStore.streamingThinking,
+		target: chatStore.streamingTarget,
+		// Low-frequency fields for the "waiting" dots — included here (rather
+		// than read off ChatCenter's snapshot) so the dots live in the same
+		// subtree that knows whether reply text has started.
+		isSending: chatStore.isSending,
+		hasError: chatStore.streamingError !== "",
+		hasPendingQuestion: chatStore.pendingQuestion !== null,
+		activeToolCount: chatStore.activeTools.length,
+	}));
+
+	const normalized = useMemo(() => normalizeMarkdownMath(stream.text), [stream.text]);
+	const { blocks, tail } = useMemo(() => splitStreamingMarkdown(normalized), [normalized]);
+
+	return (
+		<>
+			{stream.thinking ? (
+				<motion.div
+					className="flex justify-start"
+					initial={{ opacity: 0, y: 8 }}
+					animate={{ opacity: 1, y: 0 }}
+					transition={{ duration: 0.2, ease: "easeOut" }}
+				>
+					<details className="inno-message min-w-0 max-w-[78%] overflow-hidden rounded-lg border border-[var(--inno-border)] bg-[var(--inno-surface)] px-3 py-2 text-xs text-[var(--inno-text-muted)]">
+						<summary className="cursor-pointer break-words [overflow-wrap:anywhere]">Thinking...</summary>
+						<pre className="mt-1 max-w-full overflow-auto whitespace-pre-wrap break-words font-mono [overflow-wrap:anywhere]">{stream.thinking}</pre>
+					</details>
+				</motion.div>
+			) : null}
+
+			{stream.text && stream.target === "workspace" ? (
+				<motion.div
+					className="flex justify-start"
+					initial={{ opacity: 0, y: 8 }}
+					animate={{ opacity: 1, y: 0 }}
+					transition={{ duration: 0.2, ease: "easeOut" }}
+				>
+					<div className="inno-message max-w-[78%] rounded-lg border border-[var(--inno-border)] bg-[var(--inno-surface)] px-3 py-2 text-[13px] text-[var(--inno-text-muted)]">
+						<div className="flex min-w-0 items-center gap-2">
+							<span className="inno-stream-status-dot is-streaming shrink-0" />
+							<span className="min-w-0 break-words [overflow-wrap:anywhere]">{t("chat.streamingInWorkspace", "长内容正在右侧文件区生成")}</span>
+						</div>
+					</div>
+				</motion.div>
+			) : stream.text ? (
+				<motion.div
+					className="flex justify-start"
+					initial={{ opacity: 0, y: 8 }}
+					animate={{ opacity: 1, y: 0 }}
+					transition={{ duration: 0.2, ease: "easeOut" }}
+				>
+					<div className="inno-message inno-streaming-blocks max-w-[78%] rounded-lg border border-[var(--inno-border)] bg-[var(--inno-surface)] px-3.5 py-2.5 text-[13px] leading-relaxed text-[var(--inno-text)]">
+						{blocks.map((block, index) => (
+							<StableStreamingMarkdown key={index} content={block} />
+						))}
+						{/* Always mounted while text streams (even when the tail is
+						    momentarily empty) so the DOM node — and the height below the
+						    stable blocks — never churns mid-stream. */}
+						<markdown-artifact content={tail} />
+					</div>
+				</motion.div>
+			) : null}
+
+			{stream.isSending && !stream.hasPendingQuestion && !stream.text && !stream.hasError && stream.activeToolCount === 0 ? (
+				<motion.div
+					className="flex justify-start"
+					initial={{ opacity: 0 }}
+					animate={{ opacity: 1 }}
+					transition={{ duration: 0.15 }}
+				>
+					<div className="inno-message max-w-[78%] rounded-lg border border-[var(--inno-border)] bg-[var(--inno-surface-muted)] px-3 py-2 text-sm text-[var(--inno-text-muted)]">
+						<span className="inline-flex gap-1">
+							<span className="animate-bounce">·</span>
+							<span className="animate-bounce" style={{ animationDelay: "150ms" }}>·</span>
+							<span className="animate-bounce" style={{ animationDelay: "300ms" }}>·</span>
+						</span>
+					</div>
+				</motion.div>
+			) : null}
+		</>
 	);
 }
 
@@ -402,7 +607,7 @@ export function ChatCenter() {
 	const imageInputRef = useRef<HTMLInputElement | null>(null);
 	const scrollRef = useRef<HTMLDivElement | null>(null);
 	const shouldStickToBottomRef = useRef(true);
-	const [uploads, setUploads] = useState<{ fileName: string; path: string }[]>([]);
+	const [uploads, setUploads] = useState<PendingUpload[]>([]);
 	const [isUploading, setIsUploading] = useState(false);
 	const [inlineImages, setInlineImages] = useState<(InlineImage & { name: string; previewUrl: string })[]>([]);
 	// When the user pastes a large block of text (many lines / chars), we
@@ -422,10 +627,10 @@ export function ChatCenter() {
 
 	// Simple Mode surfaces preset workspaces for one-click start.
 	const simpleMode = useStoreSnapshot(settingsStore, () => settingsStore.settings?.simpleMode?.enabled === true);
-	// Whether the currently selected model accepts image input. Drives the
-	// paste/upload gate so users on text-only custom providers don't get
-	// silently-dropped images. Unknown/missing model → keep allowed (legacy).
-	const currentModelSupportsImages = useStoreSnapshot(settingsStore, () => {
+	// Whether the selected Provider accepts native image message blocks.
+	// Attachments remain available either way: text-only models receive the
+	// persisted workspace path and can use the OCR tool instead.
+	const currentModelSupportsNativeImages = useStoreSnapshot(settingsStore, () => {
 		const s = settingsStore.settings;
 		if (!s) return true;
 		const list = s.availableModels ?? s.configuredModels ?? [];
@@ -446,16 +651,19 @@ export function ChatCenter() {
 		void settingsStore.saveSimpleMode(next).finally(() => setTogglingMode(false));
 	}, [togglingMode]);
 
+	// NOTE: high-frequency streaming fields (streamingText / streamingThinking
+	// / streamingTarget) are deliberately excluded — they flush every 40ms and
+	// are subscribed to by StreamingBubbles instead, so token growth re-renders
+	// only that subtree. Combined with the shallow-equal guard in
+	// useStoreSnapshot, streaming emits no longer re-render ChatCenter at all.
 	const chat = useStoreSnapshot(chatStore, () => ({
 		messages: chatStore.messages,
 		isSending: chatStore.isSending,
 		isLoadingHistory: chatStore.isLoadingHistory,
-		streamingText: chatStore.streamingText,
-		streamingThinking: chatStore.streamingThinking,
-		streamingTarget: chatStore.streamingTarget,
 		streamingActivity: chatStore.streamingActivity,
 		streamingActivityDetail: chatStore.streamingActivityDetail,
 		streamingError: chatStore.streamingError,
+		canReconnect: chatStore.canReconnect,
 		activeTools: chatStore.activeTools,
 		completedTools: chatStore.completedTools,
 		lastUserPrompt: chatStore.lastUserPrompt,
@@ -497,6 +705,16 @@ export function ChatCenter() {
 
 	// Welcome state: derived once in the sessions store (single source of truth).
 	const isWelcome = sessions.isWelcome;
+	// Workspace that will receive pending attachments when Send is clicked.
+	// File selection itself never writes to this workspace, so attachments may
+	// safely follow the composer across session switches.
+	const uploadWorkspaceId: string | undefined | null = isWelcome
+		? (simpleMode || wsMode === "temp"
+			? undefined
+			: wsMode === "existing" && wsExistingId
+				? wsExistingId
+				: null)
+		: activeWorkspaceId;
 	const turnIndexByStartMessage = useMemo(
 		() => new Map(buildConversationTurns(chat.messages).map((turn) => [turn.startMessageIndex, turn.index])),
 		[chat.messages],
@@ -546,18 +764,28 @@ export function ChatCenter() {
 		}
 	}, [isWelcome, wsMode, wsExistingId, sessions.preselectedWorkspaceId]);
 
-	const scrollTextKey = chat.streamingTarget === "workspace" ? chat.streamingTarget : chat.streamingText;
+	// Stick-to-bottom scrolling, driven by a ResizeObserver on the content
+	// column: any height change — streaming flushes, Lit's async markdown
+	// renders, KaTeX, code highlighting, images — re-pins the scroll position
+	// in the same frame the growth happens. (The previous effect-based rAF
+	// scroll only fired when specific React state changed, so async renders
+	// between flushes left the view behind; combined with transient height
+	// shrink during re-parses, the pinned scrollTop got clamped and the view
+	// jumped back up towards the question.)
+	useEffect(() => {
+		const el = scrollRef.current;
+		const content = el?.querySelector<HTMLElement>("[data-conversation-content]");
+		if (!el || !content) return;
+		const observer = new ResizeObserver(() => {
+			if (shouldStickToBottomRef.current) el.scrollTop = el.scrollHeight;
+		});
+		observer.observe(content);
+		return () => observer.disconnect();
+	}, [sessions.currentSessionId]);
 
 	useEffect(() => {
 		shouldStickToBottomRef.current = true;
 	}, [sessions.currentSessionId]);
-
-	useEffect(() => {
-		requestAnimationFrame(() => {
-			const el = scrollRef.current;
-			if (el && shouldStickToBottomRef.current) el.scrollTop = el.scrollHeight;
-		});
-	}, [chat.messages, scrollTextKey, chat.streamingThinking, chat.activeTools.length, chat.completedTools.length, chat.pendingQuestion]);
 
 	const handleChatScroll = useCallback(() => {
 		const el = scrollRef.current;
@@ -638,14 +866,8 @@ export function ChatCenter() {
 		const input = expandPaste(rawValue).trim();
 		if ((!input && uploads.length === 0 && inlineImages.length === 0) || chat.isSending || isUploading) return;
 		shouldStickToBottomRef.current = true;
-
-		const uploadNote = uploads.length > 0
-			? `\n\n${t("chat.uploadedToWorkspace")}\n${uploads.map((file) => `- ${file.fileName}: ${file.path}`).join("\n")}`
-			: "";
-		const messageContent = `${input}${uploadNote}` || (inlineImages.length > 0 ? t("chat.describeImage") : "");
-		const imagesToSend = (inlineImages.length > 0 && currentModelSupportsImages)
-			? inlineImages.map(({ data, mimeType }) => ({ data, mimeType }))
-			: undefined;
+		const pendingUploads = [...uploads];
+		const pendingImages = [...inlineImages];
 
 		const resetComposer = () => {
 			draftRef.current = "";
@@ -657,34 +879,74 @@ export function ChatCenter() {
 			setPasteBlock(null);
 		};
 
-		if (isWelcome) {
-			const wsInput = buildSessionInput();
-			if ("__error" in wsInput) {
-				setWsError(wsInput.__error);
-				return;
-			}
-			setWsError("");
-			// Remember the workspace choice so the next new chat resumes it (P3).
-			if (!simpleMode) rememberWsChoice(wsMode, wsExistingId);
-			resetComposer();
-			setUploads([]);
-			setInlineImages([]);
-			void (async () => {
-				try {
+		void (async () => {
+			setIsUploading(true);
+			try {
+				let targetSessionId = sessions.currentSessionId;
+				if (isWelcome) {
+					const wsInput = buildSessionInput();
+					if ("__error" in wsInput) {
+						setWsError(wsInput.__error);
+						return;
+					}
+					setWsError("");
+					// Remember the workspace choice so the next new chat resumes it (P3).
+					if (!simpleMode) rememberWsChoice(wsMode, wsExistingId);
 					await sessionsStore.createSessionWith(wsInput);
-					void chatStore.send(messageContent, imagesToSend);
-				} catch (err) {
-					setWsError(err instanceof Error ? err.message : t("chat.errCreateSession"));
+					targetSessionId = sessionsStore.currentSessionId;
 				}
-			})();
-			return;
-		}
 
-		resetComposer();
-		setUploads([]);
-		setInlineImages([]);
-		void chatStore.send(messageContent, imagesToSend);
-	}, [isWelcome, buildSessionInput, uploads, inlineImages, chat.isSending, isUploading, simpleMode, wsMode, wsExistingId, pasteBlock, currentModelSupportsImages, t]);
+				const targetWorkspaceId = workspaceStore.activeWorkspaceId
+					?? (isWelcome ? undefined : uploadWorkspaceId ?? undefined);
+				if (pendingUploads.length > 0 && targetWorkspaceId === undefined) {
+					throw new Error(t("chat.uploadHint"));
+				}
+
+				let uploadedFiles: Array<{ fileName: string; path: string }> = [];
+				if (pendingUploads.length > 0) {
+					const uploadItems = await Promise.all(
+						pendingUploads.map(async ({ path, file }) => ({
+							path,
+							dataBase64: arrayBufferToBase64(await file.arrayBuffer()),
+						})),
+					);
+					const result = await uploadWorkspaceFiles(
+						uploadItems,
+						targetWorkspaceId,
+					);
+					uploadedFiles = (result.uploaded ?? []).map((node) => ({
+						fileName: node.name,
+						path: node.path,
+					}));
+					appStore.setRightPanelTab("preview");
+					if (appStore.workspaceMode === "collapsed") appStore.setWorkspaceMode("quarter");
+					if (workspaceStore.activeWorkspaceId !== targetWorkspaceId) {
+						await workspaceStore.setActiveWorkspace(targetWorkspaceId ?? null);
+					} else {
+						await workspaceStore.loadTree();
+					}
+				}
+
+				const uploadNote = uploadedFiles.length > 0
+					? `\n\n${t("chat.uploadedToWorkspace")}\n${uploadedFiles.map((file) => `- ${file.fileName}: ${file.path}`).join("\n")}`
+					: "";
+				const messageContent = `${input}${uploadNote}` || (pendingImages.length > 0 ? t("chat.describeImage") : "");
+				const imagesToSend = pendingImages.length > 0
+					? pendingImages.map(({ data, mimeType }) => ({ data, mimeType }))
+					: undefined;
+
+				resetComposer();
+				setUploads([]);
+				setInlineImages([]);
+				setWsError("");
+				void chatStore.send(messageContent, imagesToSend, targetSessionId);
+			} catch (err) {
+				setWsError(err instanceof Error ? err.message : t("chat.errCreateSession"));
+			} finally {
+				setIsUploading(false);
+			}
+		})();
+	}, [isWelcome, buildSessionInput, uploads, inlineImages, chat.isSending, isUploading, simpleMode, wsMode, wsExistingId, uploadWorkspaceId, pasteBlock, sessions.currentSessionId, t]);
 
 	const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLTextAreaElement>) => {
 		// Don't fire Send while the user is composing with an IME (e.g. picking
@@ -702,6 +964,10 @@ export function ChatCenter() {
 		chatStore.cancel();
 	}, []);
 
+	const handleReconnect = useCallback(() => {
+		void chatStore.reconnect();
+	}, []);
+
 	const handleRetry = useCallback(() => {
 		shouldStickToBottomRef.current = true;
 		void chatStore.retry();
@@ -709,16 +975,9 @@ export function ChatCenter() {
 
 	const addImageFiles = useCallback((files: File[]) => {
 		files.forEach((file) => {
-			const reader = new FileReader();
-			reader.onload = () => {
-				const dataUrl = reader.result as string;
-				const commaIdx = dataUrl.indexOf(",");
-				const header = dataUrl.slice(0, commaIdx);
-				const data = dataUrl.slice(commaIdx + 1);
-				const mimeType = header.match(/:(.*?);/)?.[1] ?? file.type;
-				setInlineImages((prev) => [...prev, { data, mimeType, name: file.name || "image", previewUrl: dataUrl }]);
-			};
-			reader.readAsDataURL(file);
+			void prepareInlineImage(file).then((prepared) => {
+				setInlineImages((prev) => [...prev, prepared]);
+			});
 		});
 	}, []);
 
@@ -727,7 +986,6 @@ export function ChatCenter() {
 		const imageItems = Array.from(e.clipboardData.items).filter((item) => item.type.startsWith("image/"));
 		if (imageItems.length > 0) {
 			e.preventDefault();
-			if (!currentModelSupportsImages) return; // text-only model: drop silently
 			const files = imageItems.map((item) => item.getAsFile()).filter((f): f is File => f !== null);
 			addImageFiles(files);
 			return;
@@ -763,15 +1021,14 @@ export function ChatCenter() {
 				});
 			}
 		}
-	}, [addImageFiles, currentModelSupportsImages, t]);
+	}, [addImageFiles, t]);
 
 	const handleImageFiles = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
-		if (!currentModelSupportsImages) return; // text-only model: ignore picker
 		const files = Array.from(event.target.files ?? []).filter((f) => f.type.startsWith("image/"));
 		if (files.length === 0) return;
 		addImageFiles(files);
 		if (event.target) event.target.value = "";
-	}, [addImageFiles, currentModelSupportsImages]);
+	}, [addImageFiles]);
 
 	const removeInlineImage = useCallback((index: number) => {
 		setInlineImages((prev) => prev.filter((_, i) => i !== index));
@@ -780,33 +1037,14 @@ export function ChatCenter() {
 	const handleFiles = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
 		const files = Array.from(event.target.files ?? []);
 		if (files.length === 0) return;
-		const wsId = workspaceStore.activeWorkspaceId;
-		if (!wsId) return;
-		setIsUploading(true);
-		void (async () => {
-			try {
-				const items = await Promise.all(files.map(async (file: File) => ({
-					path: file.name.replace(/[\\/?%*:|"<>]/g, "_").trim() || `upload-${Date.now()}`,
-					dataBase64: arrayBufferToBase64(await file.arrayBuffer()),
-				})));
-				const result = await uploadWorkspaceFiles(items, wsId);
-				const uploadedNodes = result.uploaded ?? [];
-				setUploads((current) => [...current, ...uploadedNodes.map((n) => ({ fileName: n.name, path: n.path }))]);
-				// Reveal the workspace panel so the new file is visible in the tree.
-				appStore.setRightPanelTab("preview");
-				if (appStore.workspaceMode === "collapsed") appStore.setWorkspaceMode("quarter");
-				void workspaceStore.loadTree();
-			} catch (err) {
-				const message = err instanceof Error ? err.message : "Unknown upload error";
-				setUploads((current) => [
-					...current,
-					{ fileName: "Upload failed", path: message },
-				]);
-			} finally {
-				setIsUploading(false);
-				if (event.target) event.target.value = "";
-			}
-		})();
+		setWsError("");
+		const items = files.map((file) => ({
+			fileName: file.name,
+			path: file.name.replace(/[\\/?%*:|"<>]/g, "_").trim() || `upload-${Date.now()}`,
+			file,
+		}));
+		setUploads((current) => [...current, ...items]);
+		if (event.target) event.target.value = "";
 	}, []);
 
 	const removeUpload = useCallback((index: number) => {
@@ -870,10 +1108,10 @@ export function ChatCenter() {
 		<div className="inno-composer flex items-end gap-2 rounded-lg p-2">
 			<input ref={fileInputRef} id="file-input" type="file" className="hidden" multiple onChange={handleFiles} />
 			<input ref={imageInputRef} id="image-input" type="file" className="hidden" multiple accept="image/*" onChange={handleImageFiles} />
-			<button className="inno-icon-button flex h-9 w-9 shrink-0 rounded-md disabled:opacity-50" title={activeWorkspaceId ? t("chat.uploadFiles") : t("chat.uploadHint")} disabled={chat.isSending || isUploading || !activeWorkspaceId} onClick={() => fileInputRef.current?.click()}>
+			<button className="inno-icon-button flex h-9 w-9 shrink-0 rounded-md disabled:opacity-50" title={t("chat.uploadFiles")} disabled={chat.isSending || isUploading} onClick={() => fileInputRef.current?.click()}>
 				{isUploading ? <Spinner size={16} /> : <Paperclip size={16} />}
 			</button>
-			<button className="inno-icon-button flex h-9 w-9 shrink-0 rounded-md disabled:opacity-50" title={currentModelSupportsImages ? t("chat.attachImage") : t("chat.imageNotSupported")} disabled={chat.isSending || !currentModelSupportsImages} onClick={() => imageInputRef.current?.click()}>
+			<button className="inno-icon-button flex h-9 w-9 shrink-0 rounded-md disabled:opacity-50" title={currentModelSupportsNativeImages ? t("chat.attachImage") : t("chat.attachImageViaOcr")} disabled={chat.isSending || isUploading} onClick={() => imageInputRef.current?.click()}>
 				<Image size={16} />
 			</button>
 			<textarea
@@ -886,16 +1124,27 @@ export function ChatCenter() {
 				onKeyDown={handleKeyDown}
 				onInput={handleInput}
 				onPaste={handlePaste}
-				disabled={chat.isSending || isUploading}
+				disabled={chat.isSending || isUploading || !!chat.pendingQuestion}
 			/>
 			{chat.isSending ? (
-				<button
-					className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-[var(--inno-danger)] text-white transition-opacity hover:opacity-90 active:scale-[0.97]"
-					title={t("chat.stopGeneration")}
-					onClick={handleStop}
-				>
-					<Square size={16} />
-				</button>
+				<>
+					{chat.canReconnect ? (
+						<button
+							className="inno-icon-button flex h-9 w-9 shrink-0 rounded-md"
+							title={t("chat.reconnect", "重新连接")}
+							onClick={handleReconnect}
+						>
+							<RotateCcw size={16} />
+						</button>
+					) : null}
+					<button
+						className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-[var(--inno-danger)] text-white transition-opacity hover:opacity-90 active:scale-[0.97]"
+						title={t("chat.stopGeneration")}
+						onClick={handleStop}
+					>
+						<Square size={16} />
+					</button>
+				</>
 			) : (
 				<>
 					{chat.lastUserPrompt ? (
@@ -1114,20 +1363,6 @@ export function ChatCenter() {
 						</motion.div>
 					) : null}
 
-					{chat.streamingThinking ? (
-						<motion.div
-							className="flex justify-start"
-							initial={{ opacity: 0, y: 8 }}
-							animate={{ opacity: 1, y: 0 }}
-							transition={{ duration: 0.2, ease: "easeOut" }}
-						>
-							<details className="inno-message min-w-0 max-w-[78%] overflow-hidden rounded-lg border border-[var(--inno-border)] bg-[var(--inno-surface)] px-3 py-2 text-xs text-[var(--inno-text-muted)]">
-								<summary className="cursor-pointer break-words [overflow-wrap:anywhere]">Thinking...</summary>
-								<pre className="mt-1 max-w-full overflow-auto whitespace-pre-wrap break-words font-mono [overflow-wrap:anywhere]">{chat.streamingThinking}</pre>
-							</details>
-						</motion.div>
-					) : null}
-
 					{chat.completedTools.length > 0 ? (
 						<motion.div
 							className="flex justify-start"
@@ -1146,32 +1381,8 @@ export function ChatCenter() {
 						</motion.div>
 					) : null}
 
-					{chat.streamingText && chat.streamingTarget === "workspace" ? (
-						<motion.div
-							className="flex justify-start"
-							initial={{ opacity: 0, y: 8 }}
-							animate={{ opacity: 1, y: 0 }}
-							transition={{ duration: 0.2, ease: "easeOut" }}
-						>
-							<div className="inno-message max-w-[78%] rounded-lg border border-[var(--inno-border)] bg-[var(--inno-surface)] px-3 py-2 text-[13px] text-[var(--inno-text-muted)]">
-								<div className="flex min-w-0 items-center gap-2">
-									<span className="inno-stream-status-dot is-streaming shrink-0" />
-									<span className="min-w-0 break-words [overflow-wrap:anywhere]">{t("chat.streamingInWorkspace", "长内容正在右侧文件区生成")}</span>
-								</div>
-							</div>
-						</motion.div>
-					) : chat.streamingText ? (
-						<motion.div
-							className="flex justify-start"
-							initial={{ opacity: 0, y: 8 }}
-							animate={{ opacity: 1, y: 0 }}
-							transition={{ duration: 0.2, ease: "easeOut" }}
-						>
-							<div className="inno-message max-w-[78%] rounded-lg border border-[var(--inno-border)] bg-[var(--inno-surface)] px-3.5 py-2.5 text-[13px] leading-relaxed text-[var(--inno-text)]">
-								<markdown-artifact content={normalizeMarkdownMath(chat.streamingText)} />
-							</div>
-						</motion.div>
-					) : null}
+					{/* Thinking + reply text bubbles — own store subscription, see above */}
+					<StreamingBubbles />
 
 					{chat.streamingError ? (
 						<motion.div
@@ -1182,23 +1393,6 @@ export function ChatCenter() {
 						>
 							<div className="inno-message max-w-[78%]">
 								<ErrorBlock error={chat.streamingError} />
-							</div>
-						</motion.div>
-					) : null}
-
-					{chat.isSending && !chat.pendingQuestion && !chat.streamingText && !chat.streamingError && chat.activeTools.length === 0 ? (
-						<motion.div
-							className="flex justify-start"
-							initial={{ opacity: 0 }}
-							animate={{ opacity: 1 }}
-							transition={{ duration: 0.15 }}
-						>
-							<div className="inno-message max-w-[78%] rounded-lg border border-[var(--inno-border)] bg-[var(--inno-surface-muted)] px-3 py-2 text-sm text-[var(--inno-text-muted)]">
-								<span className="inline-flex gap-1">
-									<span className="animate-bounce">·</span>
-									<span className="animate-bounce" style={{ animationDelay: "150ms" }}>·</span>
-									<span className="animate-bounce" style={{ animationDelay: "300ms" }}>·</span>
-								</span>
 							</div>
 						</motion.div>
 					) : null}
@@ -1220,6 +1414,7 @@ export function ChatCenter() {
 					{renderUploadChips()}
 					{renderInlineImagePreviews()}
 					{renderQuestionHint()}
+					{wsError ? <p className="mb-2 text-xs text-[var(--inno-danger)]">{wsError}</p> : null}
 					{renderComposer(t("chat.composerPlaceholder"))}
 				</div>
 			</div>
