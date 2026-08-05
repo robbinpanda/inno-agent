@@ -24,7 +24,7 @@ import { groupByCategory, matchesQuery } from "../utils/category-grouping.js";
 import { useStoreSnapshot } from "./hooks.js";
 import { QuestionDialog } from "./QuestionDialog.js";
 import { buildConversationTurns, ConversationMinimap } from "./ConversationMinimap.js";
-import "@earendil-works/pi-web-ui";
+import { MarkdownArtifact } from "./MarkdownArtifact.js";
 
 // Thresholds for collapsing a large paste into a placeholder chip. A paste
 // crossing EITHER threshold is collapsed. Tuned so normal multi-line typing
@@ -222,7 +222,7 @@ function AssistantContent({ content }: { content: string }) {
 	const normalized = useMemo(() => normalizeMarkdownMath(trimmed), [trimmed]);
 	if (!trimmed) return null;
 	if (!shouldCollapseAssistantContent(trimmed)) {
-		return <markdown-artifact content={normalized} />;
+		return <MarkdownArtifact content={normalized} />;
 	}
 	const lineCount = trimmed.split(/\r\n|\r|\n/).length;
 	const preview = trimmed.slice(0, 900);
@@ -235,7 +235,7 @@ function AssistantContent({ content }: { content: string }) {
 			</div>
 			{expanded ? (
 				<div className="max-h-[60vh] overflow-auto rounded border border-[var(--inno-border)] bg-[var(--inno-surface)] p-2">
-					<markdown-artifact content={normalized} />
+					<MarkdownArtifact content={normalized} />
 				</div>
 			) : (
 				<pre className="max-h-36 overflow-hidden whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-[var(--inno-text-muted)] [overflow-wrap:anywhere]">
@@ -355,7 +355,7 @@ const MessageBubble = memo(function MessageBubble({ message, showChannel }: { me
  * (no re-parse shrink that could yank the scroll position upwards).
  */
 const StableStreamingMarkdown = memo(function StableStreamingMarkdown({ content }: { content: string }) {
-	return <markdown-artifact content={content} />;
+	return <MarkdownArtifact content={content} />;
 });
 
 /**
@@ -380,6 +380,32 @@ function StreamingBubbles() {
 
 	const normalized = useMemo(() => normalizeMarkdownMath(stream.text), [stream.text]);
 	const { blocks, tail } = useMemo(() => splitStreamingMarkdown(normalized), [normalized]);
+
+	// Shrink guard: while a reply streams, the tail <markdown-artifact> re-parses
+	// on every flush — code fences open and close as characters arrive, tables
+	// snap into being when their separator row lands — and its height briefly
+	// shrinks before settling taller. The stick-to-bottom pin faithfully
+	// amplifies each transient shrink into a visible yank. Hold the bubble at
+	// the tallest height seen so far (via min-height) so re-parse shrinks are
+	// absorbed as blank space inside the bubble instead of moving the layout.
+	// The callback ref re-arms per bubble mount, so each turn starts fresh.
+	const heightWatermarkRef = useRef(0);
+	const bubbleObserverRef = useRef<ResizeObserver | null>(null);
+	const streamingBubbleRef = useCallback((el: HTMLDivElement | null) => {
+		bubbleObserverRef.current?.disconnect();
+		bubbleObserverRef.current = null;
+		if (!el) return;
+		heightWatermarkRef.current = 0;
+		el.style.minHeight = "";
+		const observer = new ResizeObserver(() => {
+			const height = el.offsetHeight;
+			if (height > heightWatermarkRef.current) heightWatermarkRef.current = height;
+			const minHeight = `${heightWatermarkRef.current}px`;
+			if (el.style.minHeight !== minHeight) el.style.minHeight = minHeight;
+		});
+		observer.observe(el);
+		bubbleObserverRef.current = observer;
+	}, []);
 
 	return (
 		<>
@@ -418,14 +444,14 @@ function StreamingBubbles() {
 					animate={{ opacity: 1, y: 0 }}
 					transition={{ duration: 0.2, ease: "easeOut" }}
 				>
-					<div className="inno-message inno-streaming-blocks max-w-[78%] rounded-lg border border-[var(--inno-border)] bg-[var(--inno-surface)] px-3.5 py-2.5 text-[13px] leading-relaxed text-[var(--inno-text)]">
+					<div ref={streamingBubbleRef} className="inno-message inno-streaming-blocks max-w-[78%] rounded-lg border border-[var(--inno-border)] bg-[var(--inno-surface)] px-3.5 py-2.5 text-[13px] leading-relaxed text-[var(--inno-text)]">
 						{blocks.map((block, index) => (
 							<StableStreamingMarkdown key={index} content={block} />
 						))}
 						{/* Always mounted while text streams (even when the tail is
 						    momentarily empty) so the DOM node — and the height below the
 						    stable blocks — never churns mid-stream. */}
-						<markdown-artifact content={tail} />
+						<MarkdownArtifact content={tail} />
 					</div>
 				</motion.div>
 			) : null}
@@ -772,12 +798,21 @@ export function ChatCenter() {
 	// between flushes left the view behind; combined with transient height
 	// shrink during re-parses, the pinned scrollTop got clamped and the view
 	// jumped back up towards the question.)
+	//
+	// The sticky flag is updated ONLY in response to genuine user gestures
+	// (wheel / touch / scrollbar drag / keyboard). Scroll-position changes also
+	// come from our own pins, from browser clamping after transient content
+	// shrink, and from CSS scroll anchoring during markdown re-renders — all of
+	// which fire scroll events whose distance-from-bottom says nothing about
+	// user intent. Treating those as "user scrolled away" wrongly disengaged
+	// sticking, and the view ended up back near the question at turn end.
 	useEffect(() => {
 		const el = scrollRef.current;
 		const content = el?.querySelector<HTMLElement>("[data-conversation-content]");
 		if (!el || !content) return;
 		const observer = new ResizeObserver(() => {
-			if (shouldStickToBottomRef.current) el.scrollTop = el.scrollHeight;
+			if (!shouldStickToBottomRef.current) return;
+			el.scrollTop = el.scrollHeight;
 		});
 		observer.observe(content);
 		return () => observer.disconnect();
@@ -787,10 +822,36 @@ export function ChatCenter() {
 		shouldStickToBottomRef.current = true;
 	}, [sessions.currentSessionId]);
 
+	const userScrollGestureRef = useRef(false);
+	const markUserScrollGesture = useCallback(() => {
+		userScrollGestureRef.current = true;
+	}, []);
+	// Only presses on the scrollbar track (right edge) count as scroll gestures —
+	// plain content clicks (text selection, links, buttons) must not, or the next
+	// programmatic/anchoring scroll event would be mistaken for user intent.
+	const handleScrollerPointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+		const el = scrollRef.current;
+		if (!el) return;
+		if (event.clientX >= el.getBoundingClientRect().right - 24) markUserScrollGesture();
+	}, [markUserScrollGesture]);
+
 	const handleChatScroll = useCallback(() => {
 		const el = scrollRef.current;
 		if (!el) return;
-		shouldStickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 96;
+		const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+		// Reaching the bottom always re-engages sticking, no matter how the
+		// scroll was initiated (user gesture, smooth-scroll button, or a pin).
+		if (distanceFromBottom < 96) {
+			shouldStickToBottomRef.current = true;
+			userScrollGestureRef.current = false;
+			return;
+		}
+		// Away from the bottom: only a real user gesture may disengage sticking.
+		// Echoes of programmatic pins, clamping, and scroll-anchoring shifts are
+		// ignored — see the comment above the observer.
+		if (!userScrollGestureRef.current) return;
+		userScrollGestureRef.current = false;
+		shouldStickToBottomRef.current = false;
 	}, []);
 
 	const pauseAutoScroll = useCallback(() => {
@@ -1289,6 +1350,9 @@ export function ChatCenter() {
 				<div
 					ref={scrollRef}
 					onScroll={handleChatScroll}
+					onWheel={markUserScrollGesture}
+					onTouchStart={markUserScrollGesture}
+					onPointerDown={handleScrollerPointerDown}
 					className="chat-scroll inno-chat-grid h-full min-h-0 overflow-y-auto px-4 py-4"
 				>
 					<div data-conversation-content className="mx-auto flex min-w-0 max-w-3xl flex-col gap-3">
